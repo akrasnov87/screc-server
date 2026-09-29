@@ -1,0 +1,22 @@
+services:
+  screc-server:
+    build:
+      context: .
+      tags:
+        - akrasnov87/screc-server:latest
+        - akrasnov87/screc-server:${VERSION:-latest}
+    image: screc-server:latest
+    container_name: screc-server
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    env_file:
+      - .env
+
+    volumes:
+      # данные (дерево записей)
+      - ./data:/data
+      # логи
+      - ./logs:/logs

@@ -1,0 +1,178 @@
+"""Pydantic-схемы запросов и ответов."""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+# --- Публикация записи --------------------------------------------------
+class RecordPayload(BaseModel):
+    # Если id не задан — сервер сгенерирует UUID.
+    id: Optional[str] = None
+
+    project: str = Field(min_length=1, max_length=200)
+    year: str = Field(min_length=4, max_length=4)
+    month: str = Field(min_length=1, max_length=2)
+    folder_name: str = Field(min_length=1, max_length=250)
+
+    name: str = ""
+    description: str = ""
+    comment: str = ""
+    source: str = "record"
+    is_scrum: bool = False
+
+    date: str = ""
+    time: str = ""
+
+    tags: List[str] = Field(default_factory=list)
+
+    summary_bb: str = ""
+    prompt: str = ""
+    prompt_name: str = ""
+    prompt_edited: bool = False
+    name_template: str = ""
+    name_abbr: str = ""
+
+    generate_summary: bool = False
+    generate_deepseek_prompt: bool = True
+    include_name_in_prompt: bool = True
+    include_project_in_prompt: bool = True
+    include_comment_in_prompt: bool = True
+    include_tags_in_prompt: bool = True
+
+    video_url: str = ""
+    video_size: int = 0
+    video_mime: str = ""
+    video_duration: float = 0.0
+
+
+class ArtifactInfo(BaseModel):
+    kind: str
+    filename: str
+    size: int
+    sha256: str
+
+
+class RecordResponse(BaseModel):
+    id: str
+    revision: int
+    action: str          # create / update
+    path: str
+    artifacts: List[ArtifactInfo]
+
+
+class RecordFull(BaseModel):
+    id: str
+    revision: int
+    project: str
+    year: str
+    month: str
+    folder_name: str
+    path: str
+
+    name: str
+    description: str
+    comment: str
+    source: str
+    is_scrum: bool
+    date: str
+    time: str
+    created_at: str
+    updated_at: str
+    tags: List[str]
+
+    summary_bb: str
+    prompt: str
+    prompt_name: str
+    prompt_edited: bool
+    name_template: str
+    name_abbr: str
+
+    generate_summary: bool
+    generate_deepseek_prompt: bool
+    include_name_in_prompt: bool
+    include_project_in_prompt: bool
+    include_comment_in_prompt: bool
+    include_tags_in_prompt: bool
+
+    artifacts: List[ArtifactInfo] = Field(default_factory=list)
+    video: Optional[Dict[str, Any]] = None
+
+
+# --- PATCH --------------------------------------------------------------
+class RecordPatch(BaseModel):
+    summary_bb: Optional[str] = None
+    comment: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    is_scrum: Optional[bool] = None
+    generate_summary: Optional[bool] = None
+    generate_deepseek_prompt: Optional[bool] = None
+    include_name_in_prompt: Optional[bool] = None
+    include_project_in_prompt: Optional[bool] = None
+    include_comment_in_prompt: Optional[bool] = None
+    include_tags_in_prompt: Optional[bool] = None
+    prompt: Optional[str] = None
+    prompt_name: Optional[str] = None
+    prompt_edited: Optional[bool] = None
+    video_url: Optional[str] = None
+    video_size: Optional[int] = None
+    video_mime: Optional[str] = None
+
+
+# --- Дерево -------------------------------------------------------------
+class TreeProject(BaseModel):
+    name: str
+    years: List[str] = Field(default_factory=list)
+    records_count: int = 0
+
+
+class TreeMonth(BaseModel):
+    month: str
+    records_count: int = 0
+
+
+class TreeRecord(BaseModel):
+    id: str
+    folder_name: str
+    name: str
+    date: str
+    tags: List[str] = Field(default_factory=list)
+    has_summary: bool = False
+    artifacts_count: int = 0
+
+
+# --- Синхронизация ------------------------------------------------------
+class SyncChange(BaseModel):
+    rev: int
+    ts: str
+    entity: str
+    action: str
+    id: str
+    path: str
+    payload: Optional[Dict[str, Any]] = None
+    old_path: Optional[str] = None
+
+
+class SyncChangesResponse(BaseModel):
+    server_revision: int
+    has_more: bool
+    changes: List[SyncChange]
+
+
+class SyncSnapshotResponse(BaseModel):
+    server_revision: int
+    total: int
+    records: List[RecordFull]
+
+
+class HealthResponse(BaseModel):
+    status: str
+    revision: int
+    records_count: int
+    data_root: str
+    fts_enabled: bool
+    time: str
