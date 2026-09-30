@@ -29,6 +29,10 @@ async def create_or_update_record(
     payload: str = Form(..., description="JSON с метаданными"),
     files: List[UploadFile] = File(default=[]),
     kinds: List[str] = Form(default=[]),
+    # Параллельный массив хэшей. Может быть пустым, короче массива
+    # files или такой же длины. Если для файла хэш не задан — сервер
+    # перезаписывает его принудительно.
+    sha256: List[str] = Form(default=[]),
 ) -> RecordResponse:
     """
     Создаёт или обновляет запись.
@@ -36,6 +40,8 @@ async def create_or_update_record(
     payload — JSON-строка с RecordPayload.
     files — «лёгкие» файлы (transcript, protocol, attachments).
     kinds — параллельный массив типов для files.
+    sha256 — параллельный массив хэшей (опционально, для
+             пропуска повторной загрузки одинаковых файлов).
     """
     raw = payload.encode("utf-8")
     if len(raw) > settings.max_payload_bytes:
@@ -58,7 +64,14 @@ async def create_or_update_record(
             f"({len(files)})",
         )
 
-    parsed_files: List[tuple[str, str, bytes]] = []
+    if sha256 and len(sha256) != len(files):
+        raise HTTPException(
+            400,
+            f"sha256 length ({len(sha256)}) != files length "
+            f"({len(files)})",
+        )
+
+    parsed_files: List[tuple] = []
     for i, f in enumerate(files):
         content = await f.read()
         if len(content) > settings.max_artifact_bytes:
@@ -68,15 +81,23 @@ async def create_or_update_record(
                 f"{len(content)} > {settings.max_artifact_bytes}",
             )
         kind = kinds[i] if i < len(kinds) else "attachment"
-        parsed_files.append((kind, f.filename or f"file_{i}", content))
+        sha_i = sha256[i].strip() if i < len(sha256) else None
+        if sha_i == "":
+            sha_i = None
+        parsed_files.append(
+            (kind, f.filename or f"file_{i}", content, sha_i)
+        )
 
     result = await records_service.create_or_update(
         payload=data, files=parsed_files,
     )
     log.info(
-        "Запись %s: id=%s, revision=%d, файлов=%d",
+        "Запись %s: id=%s, revision=%d, файлов=%d, "
+        "пропущено=%d, загружено=%d",
         result["action"], result["id"], result["revision"],
         len(parsed_files),
+        len(result.get("skipped_artifacts", [])),
+        len(result.get("uploaded_artifacts", [])),
     )
     return RecordResponse(**result)
 

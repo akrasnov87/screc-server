@@ -1,7 +1,7 @@
 # Техническая документация API сервиса `screc-server`
 
-Версия: **1.0.0**
-Назначение: синхронизация записей (протоколов, стенограмм, summary) между клиентами одного пользователя через HTTP API. Хранение — файловая система, без БД.
+**Версия:** 1.1.0
+**Назначение:** синхронизация записей (протоколов, стенограмм, summary) между клиентами одного пользователя через HTTP API. Хранение — файловая система, без БД.
 
 ---
 
@@ -13,12 +13,13 @@
 4. [Модель данных](#4-модель-данных)
 5. [Структура хранилища](#5-структура-хранилища)
 6. [Справочник эндпоинтов](#6-справочник-эндпоинтов)
-7. [Сценарии интеграции](#7-сценарии-интеграции)
-8. [Ошибки](#8-ошибки)
-9. [Ограничения и лимиты](#9-ограничения-и-лимиты)
-10. [Пример клиента на Python](#10-пример-клиента-на-python)
-11. [Эксплуатация](#11-эксплуатация)
-12. [Версионирование и совместимость](#12-версионирование-и-совместимость)
+7. [Работа с хэш-суммами](#7-работа-с-хэш-суммами)
+8. [Сценарии интеграции](#8-сценарии-интеграции)
+9. [Ошибки](#9-ошибки)
+10. [Ограничения и лимиты](#10-ограничения-и-лимиты)
+11. [Пример клиента на Python](#11-пример-клиента-на-python)
+12. [Эксплуатация](#12-эксплуатация)
+13. [Версионирование и совместимость](#13-версионирование-и-совместимость)
 
 ---
 
@@ -31,6 +32,8 @@
 - Отдаёт ссылки на большие файлы (видео, аудио) — сами файлы не загружаются.
 - Поддерживает delta-синхронизацию через монотонный `revision` и `changelog.jsonl`.
 - Даёт полнотекстовый поиск (инвертированный индекс в JSON).
+- **Проверяет SHA-256 артефактов** — можно не перезаписывать файл, если он уже сохранён (см. §7).
+- **Поддерживает условную загрузку** — клиент может спросить, нужно ли вообще отправлять файл.
 
 ### 1.2. Чего сервис **не** делает
 
@@ -38,6 +41,7 @@
 - Не запускает транскрибацию/суммаризацию.
 - Не управляет правами — один API-ключ на весь сервис.
 - Не различает пользователей — вся модель под одного владельца.
+- Не делает глобальную дедупликацию по контенту (одинаковый файл под разными именами будет сохранён дважды).
 
 ### 1.3. Технологии
 
@@ -49,6 +53,7 @@
 | Конфигурация | pydantic-settings |
 | Хранилище | файловая система |
 | Логи | logging + RotatingFileHandler |
+| Хэши | SHA-256 |
 
 ---
 
@@ -76,7 +81,7 @@ curl -s http://localhost:8000/health | jq
 {
   "status": "ok",
   "service": "screc-sync",
-  "time": "2026-09-29T12:05:00Z"
+  "time": "2026-09-30T12:05:00Z"
 }
 ```
 
@@ -192,7 +197,8 @@ X-API-Key: <ключ>
 | `kind` | string | `transcript` / `summary` / `protocol` / `manual_protocol` / `deepseek_prompt` / `attachment` |
 | `filename` | string | Оригинальное имя файла |
 | `size` | int | Размер в байтах |
-| `sha256` | string | SHA-256 содержимого |
+| `sha256` | string | SHA-256 содержимого (считается сервером) |
+| `deleted_at` | string \| null | Если задано — артефакт помечен soft-deleted |
 
 ### 4.4. `TreeRecord` — элемент списка в дереве
 
@@ -212,12 +218,47 @@ X-API-Key: <ключ>
 |---|---|---|
 | `rev` | int | Номер ревизии |
 | `ts` | string | ISO-8601 UTC |
-| `entity` | string | Всегда `"record"` (пока) |
-| `action` | string | `create` / `update` / `delete` / `update_links` |
+| `entity` | string | `"record"` или `"artifact"` |
+| `action` | string | см. таблицу ниже |
 | `id` | string | ID записи |
 | `path` | string | Относительный путь |
 | `payload` | object \| null | Метаданные изменения |
 | `old_path` | string \| null | Прежний путь (для `move`) |
+
+**Значения `action`:**
+
+| `entity` | `action` | Что означает |
+|---|---|---|
+| `record` | `create` | Создана новая запись |
+| `record` | `update` | Обновлены поля записи |
+| `record` | `delete` | Удалена (soft или hard) |
+| `record` | `update_links` | Обновлена ссылка на видео/аудио |
+| `artifact` | `artifact_upload` | Загружен новый/обновлённый артефакт |
+| `artifact` | `artifact_delete` | Удалён артефакт (физически) |
+| `artifact` | `artifact_soft_delete` | Помечен как удалённый |
+| `artifact` | `artifact_delete_all` | Удалены все артефакты записи |
+
+### 4.6. `ArtifactCheckItem` / `ArtifactCheckResult`
+
+Схемы для эндпоинта `POST /records/{id}/artifacts/check`.
+
+**`ArtifactCheckItem`:**
+
+| Поле | Тип | Обяз. |
+|---|---|---|
+| `filename` | string | ✅ |
+| `sha256` | string \| null | ❌ |
+
+**`ArtifactCheckResult`:**
+
+| Поле | Тип | Описание |
+|---|---|---|
+| `filename` | string | Имя файла |
+| `sha256` | string | Хэш существующего файла (`""`, если файла нет) |
+| `skip` | bool | `true` — файл уже есть с таким хэшем, загрузка не нужна |
+| `reason` | string | См. §7 |
+| `size` | int | Размер существующего файла |
+| `kind` | string | Тип существующего артефакта (`""`, если нет) |
 
 ---
 
@@ -288,13 +329,19 @@ X-API-Key: <ключ>
       "kind": "transcript",
       "filename": "transcript_запись.md",
       "size": 45678,
-      "sha256": "abc123..."
+      "sha256": "abc123...",
+      "deleted_at": null
     }
   ],
   "revision": 101,
   "deleted_at": null
 }
 ```
+
+**Про `artifacts[]`:**
+
+- `sha256` — сервер считает сам, всегда.
+- `deleted_at` — `null` для живых артефактов; ISO-таймстемп, если soft-deleted.
 
 ### 5.4. Формат `_links.json`
 
@@ -318,9 +365,11 @@ X-API-Key: <ключ>
 Одна строка = одно событие:
 
 ```jsonl
-{"rev":1,"ts":"2026-09-08T08:35:00+00:00","entity":"record","action":"create","id":"770e...","path":"vNext/2026/09/2026-09-08 формирование...","payload":{"full":true,"project":"vNext","date":"2026-09-08"}}
-{"rev":2,"ts":"2026-09-08T09:00:00+00:00","entity":"record","action":"update","id":"770e...","path":"vNext/2026/09/2026-09-08 формирование...","payload":{"changed":["summary_bb","tags"]}}
-{"rev":3,"ts":"2026-09-08T10:00:00+00:00","entity":"record","action":"delete","id":"770e...","path":"vNext/2026/09/2026-09-08 формирование..."}
+{"rev":1,"ts":"...","entity":"record","action":"create","id":"770e...","path":"vNext/2026/09/...","payload":{"full":true,"project":"vNext","date":"2026-09-08","skipped_artifacts":[],"uploaded_artifacts":["transcript.md"]}}
+{"rev":2,"ts":"...","entity":"record","action":"update","id":"770e...","path":"vNext/2026/09/...","payload":{"changed":["summary_bb","tags"]}}
+{"rev":3,"ts":"...","entity":"artifact","action":"artifact_upload","id":"770e...","path":"vNext/2026/09/...","payload":{"filename":"transcript.md","kind":"transcript","size":12345,"sha256":"abc...","reason":"artifact_absent"}}
+{"rev":4,"ts":"...","entity":"artifact","action":"artifact_delete","id":"770e...","path":"vNext/2026/09/...","payload":{"filename":"transcript.md","hard":true}}
+{"rev":5,"ts":"...","entity":"record","action":"delete","id":"770e...","path":"vNext/2026/09/..."}
 ```
 
 ---
@@ -333,8 +382,6 @@ X-API-Key: <ключ>
 
 #### `GET /health` — без авторизации
 
-Проверка работоспособности.
-
 **Ответ 200:**
 
 ```json
@@ -344,7 +391,7 @@ X-API-Key: <ключ>
   "records_count": 42,
   "data_root": "/data",
   "fts_enabled": true,
-  "time": "2026-09-29T12:05:00+00:00"
+  "time": "2026-09-30T12:05:00+00:00"
 }
 ```
 
@@ -399,6 +446,8 @@ X-API-Key: <ключ>
 ]
 ```
 
+Записи с `_deleted.json` в этот список не попадают.
+
 ---
 
 ### 6.3. Записи
@@ -414,10 +463,13 @@ X-API-Key: <ключ>
 | `payload` | string (JSON) | ✅ | JSON-строка с `RecordPayload`. |
 | `files` | file[] | ❌ | Артефакты. |
 | `kinds` | string[] | ❌ | Параллельный массив типов для `files`. |
+| `sha256` | string[] | ❌ | Параллельный массив SHA-256 хэшей для `files`. |
 
 **Правила:**
-- Если `kinds` задан, его длина должна совпадать с длиной `files`.
+- Длина `kinds` и `sha256`, если заданы, должна совпадать с длиной `files`.
 - Если `kinds` не задан — все файлы получат `kind="attachment"`.
+- Если `sha256[i]` пустой — для этого файла проверка не применяется, файл перезаписывается принудительно.
+- Если `sha256[i]` совпадает с уже сохранённым артефактом с таким же именем — файл **не перезаписывается** (см. §7).
 - Максимальный размер `payload`: `SCREC_MAX_PAYLOAD_KB` (по умолчанию 512 КБ).
 - Максимальный размер каждого файла: `SCREC_MAX_ARTIFACT_MB` (по умолчанию 50 МБ).
 
@@ -430,23 +482,24 @@ X-API-Key: <ключ>
   "action": "create",
   "path": "vNext/2026/09/2026-09-08 формирование реестра замечаний после ПСИ",
   "artifacts": [
-    {
-      "kind": "transcript",
-      "filename": "transcript_запись.md",
-      "size": 45678,
-      "sha256": "abc123..."
-    }
+    {"kind": "transcript", "filename": "transcript_запись.md", "size": 45678, "sha256": "abc123..."}
+  ],
+  "skipped_artifacts": [],
+  "uploaded_artifacts": [
+    {"kind": "transcript", "filename": "transcript_запись.md", "size": 45678, "sha256": "abc123..."}
   ]
 }
 ```
 
 - `action` = `"create"` при первой публикации, `"update"` при повторной (по тому же пути).
+- `skipped_artifacts` — артефакты, которые **не перезаписывались** (хэш совпал).
+- `uploaded_artifacts` — артефакты, которые были **сохранены** в этом запросе.
 
 **Ошибки:**
-- `400` — некорректный payload, `kinds` не совпадает с `files`.
+- `400` — некорректный payload, `kinds` или `sha256` не совпадает с `files`.
 - `413` — payload или файл превышает лимит.
 
-**Идемпотентность:** повторная публикация по тому же `(project, year, month, folder_name)` обновляет запись, а не создаёт дубликат.
+**Идемпотентность:** повторная публикация по тому же `(project, year, month, folder_name)` обновляет запись, а не создаёт дубликат. Если все файлы пропущены по хэшу — `action` = `"update"`, `uploaded_artifacts` = `[]`.
 
 ---
 
@@ -482,7 +535,7 @@ X-API-Key: <ключ>
 
 ---
 
-#### `DELETE /records/{record_id}` — удаление
+#### `DELETE /records/{record_id}` — удаление записи
 
 **Query-параметры:**
 
@@ -501,6 +554,8 @@ X-API-Key: <ключ>
 ```
 
 Soft-delete: запись исключается из `/tree`, но остаётся на диске. Событие `delete` пишется в `changelog`.
+
+**Идемпотентность:** повторный soft-delete возвращает `reason: "already_deleted"` и не создаёт новую ревизию.
 
 ---
 
@@ -557,11 +612,14 @@ Soft-delete: запись исключается из `/tree`, но остаёт
       "kind": "transcript",
       "filename": "transcript_запись.md",
       "size": 45678,
-      "sha256": "abc123..."
+      "sha256": "abc123...",
+      "deleted_at": null
     }
   ]
 }
 ```
+
+Soft-deleted артефакты тоже присутствуют, но с полем `deleted_at`.
 
 ---
 
@@ -585,34 +643,228 @@ GET /api/v1/records/770e.../artifacts/ПРОТОКОЛ%20СОВЕЩАНИЯ%20о
 
 ---
 
-#### `POST /records/{record_id}/artifacts` — загрузить артефакт
+#### `HEAD /records/{record_id}/artifacts/{filename}` — проверить перед загрузкой
 
-**Content-Type:** `multipart/form-data`
+**Назначение:** клиент спрашивает, нужно ли загружать файл, **не отправляя содержимое**.
 
-| Поле | Тип | Обяз. |
+**Заголовки запроса:**
+
+| Заголовок | Обяз. | Описание |
 |---|---|---|
-| `file` | file | ✅ |
-| `kind` | string | ❌ (по умолчанию `"attachment"`) |
+| `X-Content-SHA256` | ❌ | SHA-256 клиента (hex, нижний регистр). |
+
+**Заголовки ответа:**
+
+| Заголовок | Описание |
+|---|---|
+| `X-Artifact-Skip` | `"true"` — файл уже есть с таким хэшем, можно не грузить. `"false"` — грузить. |
+| `X-Artifact-SHA256` | Хэш существующего файла или `""`. |
+| `X-Artifact-Size` | Размер существующего файла или `0`. |
+| `X-Artifact-Kind` | Тип существующего файла или `""`. |
+
+**Коды:**
+
+| HTTP | Когда | Что делать клиенту |
+|---|---|---|
+| `200 OK` + `X-Artifact-Skip: true` | Файл есть, хэш совпал | Не грузить |
+| `200 OK` + `X-Artifact-Skip: false` | Файл есть, хэш не совпал (или не передан) | Грузить (перезапишет) |
+| `404 Not Found` | Файла нет | Грузить |
+| `404 Not Found` (запись не найдена) | Записи с таким id нет | Сначала создать запись |
+
+**Пример:**
+
+```bash
+curl -I -X HEAD \
+  "http://server/api/v1/records/770e.../artifacts/transcript.md" \
+  -H "X-API-Key: $KEY" \
+  -H "X-Content-SHA256: abc123..."
+```
+
+Ответ:
+
+```
+HTTP/1.1 200 OK
+X-Artifact-Skip: true
+X-Artifact-SHA256: abc123...
+X-Artifact-Size: 22
+X-Artifact-Kind: transcript
+```
+
+---
+
+#### `POST /records/{record_id}/artifacts/check` — пакетная проверка
+
+**Назначение:** за один запрос узнать, какие из N файлов нужно загрузить.
+
+**Content-Type:** `application/json`
+
+**Тело:**
+
+```json
+{
+  "artifacts": [
+    {"filename": "transcript.md", "sha256": "abc123..."},
+    {"filename": "protocol.docx", "sha256": "def456..."},
+    {"filename": "attachment.pdf", "sha256": "789abc..."}
+  ]
+}
+```
 
 **Ответ 200:**
 
 ```json
 {
   "id": "770e8400-...",
-  "filename": "новая_схема.docx",
-  "size": 12345
+  "results": [
+    {"filename": "transcript.md",  "sha256": "abc123...", "skip": true,  "reason": "sha256_match",     "size": 22,    "kind": "transcript"},
+    {"filename": "protocol.docx",  "sha256": "def456...", "skip": true,  "reason": "sha256_match",     "size": 4567,  "kind": "protocol"},
+    {"filename": "attachment.pdf", "sha256": "789abc...", "skip": false, "reason": "artifact_absent",  "size": 0,     "kind": ""}
+  ]
 }
 ```
 
-Если файл с таким именем уже есть — он **заменяется**. Запись в `_meta.json` обновляется.
+Клиент отправляет только те файлы, где `skip: false`.
+
+**Ошибки:** `404` — запись не найдена.
 
 ---
 
-#### `DELETE /records/{record_id}/artifacts/{filename}` — удалить
+#### `POST /records/{record_id}/artifacts` — загрузить артефакт
 
-**Ответ 200:** `{"id": "...", "filename": "...", "deleted": true}`.
+**Content-Type:** `multipart/form-data`
 
-Файл удаляется с диска и из `_meta.json`.
+| Поле | Тип | Обяз. | Описание |
+|---|---|---|---|
+| `file` | file | ✅ | Файл |
+| `kind` | string | ❌ | По умолчанию `"attachment"` |
+| `sha256` | string | ❌ | SHA-256 хэш файла (hex, нижний регистр) |
+
+**Ответ 200, если файл записан:**
+
+```json
+{
+  "id": "770e8400-...",
+  "filename": "новая_схема.docx",
+  "size": 12345,
+  "sha256": "abc123...",
+  "skipped": false,
+  "reason": "artifact_absent"
+}
+```
+
+**Ответ 200, если файл пропущен (хэш совпал):**
+
+```json
+{
+  "id": "770e8400-...",
+  "filename": "новая_схема.docx",
+  "size": 12345,
+  "sha256": "abc123...",
+  "skipped": true,
+  "reason": "sha256_match"
+}
+```
+
+---
+
+#### `DELETE /records/{record_id}/artifacts/{filename}` — удалить артефакт
+
+**Query-параметры:**
+
+| Имя | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `hard` | bool | `true` | `true` — удалить файл с диска. `false` — soft-delete (файл остаётся, но помечается). |
+
+**Ответ 200 (успешно удалён):**
+
+```json
+{
+  "id": "770e8400-...",
+  "filename": "transcript.md",
+  "deleted": true,
+  "hard": true,
+  "revision": 105,
+  "reason": "deleted"
+}
+```
+
+**Ответ 200 (файла не было — идемпотентно):**
+
+```json
+{
+  "id": "770e8400-...",
+  "filename": "transcript.md",
+  "deleted": false,
+  "hard": true,
+  "revision": 105,
+  "reason": "already_absent"
+}
+```
+
+**Возможные `reason`:**
+
+| Значение | Описание |
+|---|---|
+| `deleted` | Удалено |
+| `already_absent` | Файла не было |
+| `already_deleted` | Уже был soft-deleted |
+
+**Важно:** удаление пишется в `changelog` и инкрементирует `revision`. Клиент B, синхронизирующийся через `/sync/changes`, увидит событие `entity: "artifact"` и сможет удалить файл у себя.
+
+---
+
+#### `DELETE /records/{record_id}/artifacts` — удалить все артефакты записи
+
+**Query-параметры:**
+
+| Имя | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `hard` | bool | `true` | `true` — удалить физически. `false` — soft-delete. |
+| `keep_kinds` | string[] | `[]` | Список kind, которые **не** удалять (например, `transcript`, `summary`). |
+
+**Примеры:**
+
+```bash
+# Удалить всё
+DELETE /records/{id}/artifacts
+
+# Только пометить
+DELETE /records/{id}/artifacts?hard=false
+
+# Удалить всё, кроме стенограммы и summary
+DELETE /records/{id}/artifacts?keep_kinds=transcript&keep_kinds=summary
+```
+
+**Ответ 200:**
+
+```json
+{
+  "id": "770e8400-...",
+  "deleted_count": 4,
+  "deleted_filenames": [
+    "protocol.docx",
+    "deepseek_prompt.md",
+    "attachment.pdf",
+    "manual_protocol.md"
+  ],
+  "hard": true,
+  "revision": 107
+}
+```
+
+Если нечего удалять:
+
+```json
+{
+  "id": "770e8400-...",
+  "deleted_count": 0,
+  "deleted_filenames": [],
+  "hard": true,
+  "revision": 107
+}
+```
+
+**Важно:** пишется в `changelog` как `entity: "artifact"`, `action: "artifact_delete_all"`.
 
 ---
 
@@ -686,17 +938,32 @@ GET /api/v1/records/770e.../artifacts/ПРОТОКОЛ%20СОВЕЩАНИЯ%20о
 
 ```json
 {
-  "server_revision": 103,
+  "server_revision": 107,
   "has_more": false,
   "changes": [
     {
       "rev": 101,
-      "ts": "2026-09-29T12:05:00+00:00",
+      "ts": "2026-09-30T12:05:00+00:00",
       "entity": "record",
       "action": "create",
       "id": "770e8400-...",
       "path": "vNext/2026/09/2026-09-08 формирование...",
-      "payload": {"full": true, "project": "vNext", "date": "2026-09-08"}
+      "payload": {
+        "full": true,
+        "project": "vNext",
+        "date": "2026-09-08",
+        "skipped_artifacts": [],
+        "uploaded_artifacts": ["transcript.md"]
+      }
+    },
+    {
+      "rev": 105,
+      "ts": "2026-09-30T12:10:00+00:00",
+      "entity": "artifact",
+      "action": "artifact_delete",
+      "id": "770e8400-...",
+      "path": "vNext/2026/09/2026-09-08 формирование...",
+      "payload": {"filename": "protocol.docx", "hard": true}
     }
   ]
 }
@@ -705,8 +972,11 @@ GET /api/v1/records/770e.../artifacts/ПРОТОКОЛ%20СОВЕЩАНИЯ%20о
 **Алгоритм клиента:**
 1. Хранить `last_synced_revision` локально.
 2. Запрашивать `changes?since_revision=<last_synced_revision>`.
-3. Применять изменения, обновить `last_synced_revision = server_revision`.
-4. Если `has_more == true` — повторить с новым `since_revision`.
+3. Применять изменения:
+   - `entity: "record"` → применить запись целиком (скачать `GET /records/{id}`).
+   - `entity: "artifact"` → перезагрузить запись и привести локальные файлы в соответствие (удалить то, чего нет на сервере; скачать недостающие).
+4. Обновить `last_synced_revision = server_revision`.
+5. Если `has_more == true` — повторить с новым `since_revision`.
 
 ---
 
@@ -716,7 +986,7 @@ GET /api/v1/records/770e.../artifacts/ПРОТОКОЛ%20СОВЕЩАНИЯ%20о
 
 ```json
 {
-  "server_revision": 103,
+  "server_revision": 107,
   "total": 42,
   "records": [
     { ...RecordFull... }
@@ -728,11 +998,120 @@ GET /api/v1/records/770e.../artifacts/ПРОТОКОЛ%20СОВЕЩАНИЯ%20о
 
 ---
 
-## 7. Сценарии интеграции
+## 7. Работа с хэш-суммами
 
-### 7.1. Публикация одной записи (Python + requests)
+### 7.1. Зачем
+
+Позволяет:
+
+- Не перезаписывать файл, если его содержимое уже сохранено.
+- Не отправлять файлы, которые уже есть на сервере (через `HEAD` или `check`).
+- Делать публикации идемпотентными при сетевых сбоях.
+
+### 7.2. Правила проверки
+
+| Ситуация | Что делает сервер |
+|---|---|
+| Хэш не передан | Перезаписывает файл принудительно |
+| Хэш передан, файла нет | Загружает файл |
+| Хэш передан, файл есть, хэши совпадают | **Не перезаписывает**, возвращает `skipped: true` |
+| Хэш передан, файл есть, хэши не совпадают | Перезаписывает файл |
+
+### 7.3. Формат хэша
+
+SHA-256 в hex-нижнем регистре, 64 символа:
+
+```
+a3f1c0e2b4d8...9e7a
+```
+
+Регистр и пробелы нормализуются сервером. Пустая строка = «хэш не передан».
+
+### 7.4. Значения `reason`
+
+| Значение | Когда |
+|---|---|
+| `no_sha256_provided` | Клиент не передал хэш → файл записан принудительно |
+| `record_new` | Запись создаётся впервые → файл записан |
+| `artifact_absent` | Файла с таким именем не было → записан |
+| `sha256_match` | Хэш совпал → файл **не перезаписан** |
+| `sha256_mismatch` | Хэш передан, но не совпал → файл перезаписан |
+
+### 7.5. Серверный хэш — источник истины
+
+Даже если клиент передал «правильный» хэш, сервер **всегда** пересчитывает SHA-256 из фактического содержимого и сохраняет **свой** в `_meta.json`.
+
+Клиентский хэш используется **только** для решения «пропустить/записать». Это защищает от подмены: если клиент пришлёт чужой хэш, сервер запишет правильный, и при следующей публикации хэши разойдутся — файл будет перезаписан.
+
+### 7.6. Три способа работы
+
+#### Способ 1: обычная публикация (загружаем всегда)
+
+```bash
+curl -X POST http://server/api/v1/records \
+  -H "X-API-Key: $KEY" \
+  -F 'payload={...}' \
+  -F 'files=@transcript.md' \
+  -F 'kinds=transcript'
+```
+
+Файл уходит по сети, сервер сам решает, писать или нет.
+
+#### Способ 2: публикация с хэшами
+
+```bash
+SHA=$(sha256sum /tmp/transcript.md | awk '{print $1}')
+
+curl -X POST http://server/api/v1/records \
+  -H "X-API-Key: $KEY" \
+  -F 'payload={...}' \
+  -F 'files=@transcript.md' \
+  -F 'kinds=transcript' \
+  -F "sha256=$SHA"
+```
+
+Файл всё равно уходит, но если такой же уже есть на сервере — не будет перезаписан.
+
+#### Способ 3: условная загрузка (не отправляем файл)
+
+```bash
+# 1. Спросить сервер
+curl -I -X HEAD \
+  "http://server/api/v1/records/$ID/artifacts/transcript.md" \
+  -H "X-API-Key: $KEY" \
+  -H "X-Content-SHA256: $SHA"
+
+# Если X-Artifact-Skip: true → файл не отправляем
+# Если 404 или X-Artifact-Skip: false → отправляем
+```
+
+Или в батче:
+
+```bash
+curl -X POST "http://server/api/v1/records/$ID/artifacts/check" \
+  -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"artifacts": [{"filename": "transcript.md", "sha256": "'$SHA'"}]}'
+```
+
+**Экономия:** сам файл не уходит по сети.
+
+### 7.7. Сравнение
+
+| Способ | Трафик | Точность |
+|---|---|---|
+| Обычная публикация | Полный размер файла | Файл перезаписывается всегда |
+| Публикация с хэшем | Полный размер файла | Файл не перезаписывается, если хэш совпал |
+| Условная загрузка (`HEAD`/`check`) | ~200 байт на проверку | Файл вообще не отправляется, если хэш совпал |
+
+---
+
+## 8. Сценарии интеграции
+
+### 8.1. Публикация одной записи (Python + requests)
 
 ```python
+import hashlib
 import json
 import requests
 
@@ -740,43 +1119,141 @@ BASE = "http://localhost:8000"
 KEY = "<ваш API-ключ>"
 HEADERS = {"X-API-Key": KEY}
 
+
+def sha256_of(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 payload = {
     "project": "vNext",
     "year": "2026",
     "month": "09",
-    "folder_name": "2026-09-08 формирование реестра замечаний после ПСИ",
-    "name": "формирование реестра замечаний после ПСИ",
-    "date": "2026-09-08",
-    "time": "08-31-14",
-    "tags": ["важное", "ПСИ"],
-    "summary_bb": "**Краткое описание**\n\nОбсудили реестр.",
-    "video_url": "file:///home/user/recs/video.webm",
-    "video_size": 123456789,
-    "video_mime": "video/webm",
+    "folder_name": "2026-09-30 тест",
+    "name": "тест",
+    "date": "2026-09-30",
+    "tags": ["тест"],
+    "summary_bb": "**Краткое описание**",
 }
 
-files = [
-    ("files", ("transcript.md", open("/tmp/transcript.md", "rb"), "text/markdown")),
-    ("kinds", (None, "transcript")),
-    ("files", ("protocol.docx", open("/tmp/protocol.docx", "rb"),
-               "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
-    ("kinds", (None, "protocol")),
+files_data = [
+    ("transcript", "/tmp/transcript.md"),
+    ("protocol", "/tmp/protocol.docx"),
 ]
+
+files = []
+kinds = []
+hashes = []
+for kind, path in files_data:
+    fname = path.split("/")[-1]
+    files.append(("files", (fname, open(path, "rb"))))
+    kinds.append(("kinds", (None, kind)))
+    hashes.append(("sha256", (None, sha256_of(path))))
 
 r = requests.post(
     f"{BASE}/api/v1/records",
     headers=HEADERS,
-    data={"payload": json.dumps(payload, ensure_ascii=False)},
+    data=[
+        ("payload", (None, json.dumps(payload, ensure_ascii=False))),
+        *kinds,
+        *hashes,
+    ],
     files=files,
     timeout=60,
 )
 r.raise_for_status()
-print(r.json())
+result = r.json()
+print("Создано:", result["action"])
+print("Загружено:", [a["filename"] for a in result["uploaded_artifacts"]])
+print("Пропущено:", [a["filename"] for a in result["skipped_artifacts"]])
 ```
 
-**Важно:** `kinds` — тоже список, но каждая пара `(None, value)` идёт как отдельный элемент multipart. В `requests` порядок сохраняется.
+**Важно:** `kinds` и `sha256` — списки, но каждая пара `(None, value)` идёт как отдельный элемент multipart. В `requests` порядок сохраняется.
 
-### 7.2. Первая синхронизация на пустом клиенте
+### 8.2. Условная загрузка (не отправляем, если есть)
+
+```python
+def upload_if_needed(base, key, record_id, kind, path):
+    fname = path.split("/")[-1]
+    sha = sha256_of(path)
+
+    # 1. Спросить сервер
+    r = requests.head(
+        f"{base}/api/v1/records/{record_id}/artifacts/{fname}",
+        headers={"X-API-Key": key, "X-Content-SHA256": sha},
+        timeout=15,
+    )
+
+    if r.status_code == 200 and r.headers.get("X-Artifact-Skip") == "true":
+        return {"skipped": True, "reason": "sha256_match"}
+
+    # 2. Отправить файл
+    with open(path, "rb") as f:
+        r = requests.post(
+            f"{base}/api/v1/records/{record_id}/artifacts",
+            headers={"X-API-Key": key},
+            files={"file": (fname, f)},
+            data={"kind": kind, "sha256": sha},
+            timeout=300,
+        )
+    r.raise_for_status()
+    return r.json()
+```
+
+### 8.3. Пакетная условная загрузка
+
+```python
+def upload_batch(base, key, record_id, artifacts):
+    """
+    artifacts: [(kind, path), ...]
+    """
+    items = []
+    for kind, path in artifacts:
+        items.append({
+            "kind": kind,
+            "path": path,
+            "filename": path.split("/")[-1],
+            "sha256": sha256_of(path),
+        })
+
+    # Один запрос на проверку
+    r = requests.post(
+        f"{base}/api/v1/records/{record_id}/artifacts/check",
+        headers={"X-API-Key": key},
+        json={"artifacts": [
+            {"filename": it["filename"], "sha256": it["sha256"]}
+            for it in items
+        ]},
+        timeout=15,
+    )
+    r.raise_for_status()
+    check = {x["filename"]: x for x in r.json()["results"]}
+
+    results = {}
+    for it in items:
+        info = check[it["filename"]]
+        if info["skip"]:
+            results[it["filename"]] = {"skipped": True, "reason": info["reason"]}
+            continue
+
+        with open(it["path"], "rb") as f:
+            r = requests.post(
+                f"{base}/api/v1/records/{record_id}/artifacts",
+                headers={"X-API-Key": key},
+                files={"file": (it["filename"], f)},
+                data={"kind": it["kind"], "sha256": it["sha256"]},
+                timeout=300,
+            )
+        r.raise_for_status()
+        results[it["filename"]] = r.json()
+
+    return results
+```
+
+### 8.4. Первая синхронизация на пустом клиенте
 
 ```python
 state = {"last_synced_revision": 0}
@@ -789,6 +1266,8 @@ for rec in snap["records"]:
     # 1. Создать папку rec["path"] в локальном хранилище
     # 2. Скачать все артефакты
     for art in rec["artifacts"]:
+        if art.get("deleted_at"):
+            continue
         url = f"{BASE}/api/v1/records/{rec['id']}/artifacts/{quote(art['filename'])}"
         content = requests.get(url, headers=HEADERS).content
         # сохранить по локальному пути
@@ -797,7 +1276,7 @@ for rec in snap["records"]:
 state["last_synced_revision"] = snap["server_revision"]
 ```
 
-### 7.3. Инкрементальная синхронизация
+### 8.5. Инкрементальная синхронизация (с учётом удалений артефактов)
 
 ```python
 while True:
@@ -808,32 +1287,33 @@ while True:
     ).json()
 
     for ch in r["changes"]:
-        if ch["action"] == "delete":
-            # удалить локальную папку
-            pass
-        else:
-            # скачать запись через GET /records/{id}
+        if ch["entity"] == "record":
+            if ch["action"] == "delete":
+                # удалить локальную папку
+                pass
+            else:
+                # скачать запись через GET /records/{id}
+                rec = requests.get(
+                    f"{BASE}/api/v1/records/{ch['id']}", headers=HEADERS
+                ).json()
+                apply_record_locally(rec)
+        elif ch["entity"] == "artifact":
+            # перезагрузить запись и привести локальные файлы
+            # в соответствие: удалить то, чего нет на сервере,
+            # скачать недостающие
             rec = requests.get(
                 f"{BASE}/api/v1/records/{ch['id']}", headers=HEADERS
             ).json()
-            # применить локально
-            pass
+            reconcile_artifacts_locally(rec)
 
     state["last_synced_revision"] = r["server_revision"]
-
     if not r["has_more"]:
         break
 
 # сохранить state["last_synced_revision"] на диск
 ```
 
-### 7.4. Клиент без видео (только ссылки)
-
-При получении `RecordFull`:
-- `video.url` — использовать как есть (открывать в браузере или скачивать).
-- Если `video.url` начинается с `file://`, а файла нет — запись помечается как «видео недоступно локально».
-
-### 7.5. Обновление summary без перезагрузки файлов
+### 8.6. Обновление summary без перезагрузки файлов
 
 ```python
 requests.patch(
@@ -845,11 +1325,30 @@ requests.patch(
 
 Файлы-артефакты не трогаются. `revision` инкрементируется, изменение попадает в `changelog`.
 
+### 8.7. Удалить один артефакт
+
+```python
+requests.delete(
+    f"{BASE}/api/v1/records/{record_id}/artifacts/protocol.docx",
+    headers=HEADERS,
+)
+```
+
+### 8.8. Удалить все артефакты, кроме стенограммы
+
+```python
+requests.delete(
+    f"{BASE}/api/v1/records/{record_id}/artifacts",
+    headers=HEADERS,
+    params={"keep_kinds": ["transcript"], "hard": True},
+)
+```
+
 ---
 
-## 8. Ошибки
+## 9. Ошибки
 
-### 8.1. Формат тела ошибки
+### 9.1. Формат тела ошибки
 
 ```json
 {
@@ -857,19 +1356,19 @@ requests.patch(
 }
 ```
 
-### 8.2. Коды
+### 9.2. Коды
 
 | HTTP | Значение | Когда |
 |---|---|---|
 | 200 | OK | Успех |
-| 400 | Bad Request | Некорректный payload, `kinds` не совпадает, path traversal |
+| 400 | Bad Request | Некорректный payload, `kinds`/`sha256` не совпадает, path traversal |
 | 401 | Unauthorized | Нет или неверный `X-API-Key` |
 | 404 | Not Found | Запись/проект/файл не найдены |
 | 413 | Payload Too Large | Файл или payload превышает лимит |
 | 422 | Unprocessable Entity | Ошибки валидации Pydantic |
 | 500 | Internal Server Error | Ошибка сервера (смотрите `logs/screc.error.log`) |
 
-### 8.3. Примеры
+### 9.3. Примеры
 
 **Неверный ключ:**
 
@@ -889,9 +1388,15 @@ requests.patch(
 {"detail": "Invalid payload: 1 validation error for RecordPayload\nproject\n  Field required"}
 ```
 
+**Несовпадение длин `sha256` и `files`:**
+
+```json
+{"detail": "sha256 length (1) != files length (2)"}
+```
+
 ---
 
-## 9. Ограничения и лимиты
+## 10. Ограничения и лимиты
 
 | Параметр | Переменная | По умолчанию |
 |---|---|---|
@@ -903,10 +1408,11 @@ requests.patch(
 | Макс. длина `folder_name` | — | 250 |
 | Макс. длина `year` | — | 4 |
 | Макс. длина `month` | — | 2 |
+| Макс. артефактов на запись | — | 500 (в `check`) |
 | Индексируемый размер артефакта | — | 2 МБ |
 | Макс. результатов поиска | — | 500 |
 
-### 9.1. Санитизация имён
+### 10.1. Санитизация имён
 
 Все сегменты пути (`project`, `year`, `month`, `folder_name`) проходят через `_safe_segment`:
 - NFC-нормализация Unicode;
@@ -917,20 +1423,36 @@ requests.patch(
 
 Имена артефактов — только базовое имя (`Path(filename).name`). Путь проверяется через `assert_inside`.
 
+### 10.2. Формат хэша
+
+- SHA-256, hex-нижний регистр.
+- 64 символа.
+- Регистр и пробелы нормализуются.
+- Пустая строка = «не передан».
+
 ---
 
-## 10. Пример клиента на Python
+## 11. Пример клиента на Python
 
 ```python
-"""Минимальный клиент для screc-server."""
+"""Клиент для screc-server с поддержкой проверки хэшей."""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Optional
 from urllib.parse import quote
 
 import httpx
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class ScrecClient:
@@ -969,19 +1491,36 @@ class ScrecClient:
     def publish(
         self,
         payload: dict,
-        artifacts: list[tuple[str, Path]] | None = None,
+        artifacts: Optional[Iterable[tuple[str, Path]]] = None,
+        *,
+        send_sha256: bool = True,
     ) -> dict:
+        """
+        Публикует запись.
+
+        artifacts: [(kind, path), ...]
+        send_sha256: если True — сервер использует хэши для пропуска.
+        """
         files = []
         kinds = []
+        hashes = []
+
         for kind, path in artifacts or []:
-            files.append(("files", (path.name, path.read_bytes())))
+            files.append(
+                ("files", (path.name, path.read_bytes()))
+            )
             kinds.append(("kinds", (None, kind)))
+            if send_sha256:
+                hashes.append(
+                    ("sha256", (None, sha256_of(path)))
+                )
 
         r = self.client.post(
             "/api/v1/records",
             data=[
                 ("payload", (None, json.dumps(payload, ensure_ascii=False))),
                 *kinds,
+                *hashes,
             ],
             files=files,
         )
@@ -1023,12 +1562,115 @@ class ScrecClient:
         return target
 
     def upload_artifact(
-        self, record_id: str, kind: str, path: Path
+        self,
+        record_id: str,
+        kind: str,
+        path: Path,
+        *,
+        send_sha256: bool = True,
     ) -> dict:
+        data = {"kind": kind}
+        if send_sha256:
+            data["sha256"] = sha256_of(path)
+
         r = self.client.post(
             f"/api/v1/records/{record_id}/artifacts",
-            data={"kind": kind},
+            data=data,
             files={"file": (path.name, path.read_bytes())},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def check_artifact(
+        self,
+        record_id: str,
+        filename: str,
+        sha256: str,
+    ) -> dict:
+        """
+        Спрашивает сервер, нужно ли загружать файл.
+
+        Возвращает {"skip": bool, "reason": str, ...}.
+        """
+        r = self.client.head(
+            f"/api/v1/records/{record_id}/artifacts/{quote(filename)}",
+            headers={"X-Content-SHA256": sha256},
+        )
+        return {
+            "skip": r.headers.get("X-Artifact-Skip") == "true",
+            "exists": r.status_code == 200,
+            "sha256": r.headers.get("X-Artifact-SHA256", ""),
+            "size": int(r.headers.get("X-Artifact-Size", 0)),
+            "kind": r.headers.get("X-Artifact-Kind", ""),
+            "status_code": r.status_code,
+        }
+
+    def check_artifacts_batch(
+        self,
+        record_id: str,
+        items: list[dict],
+    ) -> dict:
+        """
+        items: [{"filename": str, "sha256": str}, ...]
+        """
+        r = self.client.post(
+            f"/api/v1/records/{record_id}/artifacts/check",
+            json={"artifacts": items},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def upload_if_needed(
+        self,
+        record_id: str,
+        kind: str,
+        path: Path,
+    ) -> dict:
+        """
+        Загружает файл, если его ещё нет на сервере.
+
+        Сначала HEAD, потом при необходимости POST.
+        """
+        sha = sha256_of(path)
+        info = self.check_artifact(record_id, path.name, sha)
+
+        if info["skip"]:
+            return {
+                "skipped": True,
+                "reason": "sha256_match",
+                "size": info["size"],
+                "sha256": info["sha256"],
+            }
+
+        return self.upload_artifact(
+            record_id, kind, path, send_sha256=True,
+        )
+
+    def delete_artifact(
+        self,
+        record_id: str,
+        filename: str,
+        hard: bool = True,
+    ) -> dict:
+        r = self.client.delete(
+            f"/api/v1/records/{record_id}/artifacts/{quote(filename)}",
+            params={"hard": hard},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def delete_all_artifacts(
+        self,
+        record_id: str,
+        hard: bool = True,
+        keep_kinds: Optional[list[str]] = None,
+    ) -> dict:
+        params: list[tuple[str, str]] = [("hard", str(hard).lower())]
+        for k in (keep_kinds or []):
+            params.append(("keep_kinds", k))
+        r = self.client.delete(
+            f"/api/v1/records/{record_id}/artifacts",
+            params=params,
         )
         r.raise_for_status()
         return r.json()
@@ -1071,32 +1713,39 @@ class ScrecClient:
 ```python
 with ScrecClient("http://localhost:8000", "my-key") as c:
     print(c.health())
-    print(c.projects())
 
+    # Публикация с хэшами (файлы всё равно отправляются)
     result = c.publish(
         payload={
             "project": "vNext",
             "year": "2026",
             "month": "09",
-            "folder_name": "2026-09-29 тест",
+            "folder_name": "2026-09-30 тест",
             "name": "тест",
-            "date": "2026-09-29",
+            "date": "2026-09-30",
         },
         artifacts=[
             ("transcript", Path("/tmp/transcript.md")),
         ],
+        send_sha256=True,
     )
-    print(result)
+    print("Пропущено:", [a["filename"] for a in result["skipped_artifacts"]])
+    print("Загружено:", [a["filename"] for a in result["uploaded_artifacts"]])
 
-    hits = c.search("тест")
-    print(hits)
+    # Условная загрузка (файл не отправляется, если есть)
+    info = c.upload_if_needed(
+        record_id=result["id"],
+        kind="attachment",
+        path=Path("/tmp/attachment.pdf"),
+    )
+    print(info)
 ```
 
 ---
 
-## 11. Эксплуатация
+## 12. Эксплуатация
 
-### 11.1. Переменные окружения
+### 12.1. Переменные окружения
 
 | Переменная | Назначение | Пример |
 |---|---|---|
@@ -1113,7 +1762,7 @@ with ScrecClient("http://localhost:8000", "my-key") as c:
 | `SCREC_FTS_ENABLED` | Включать FTS | `true` |
 | `SCREC_OPENAPI_ENABLED` | Отдавать `/docs` | `true` |
 
-### 11.2. Логи
+### 12.2. Логи
 
 | Файл | Содержимое |
 |---|---|
@@ -1126,16 +1775,24 @@ with ScrecClient("http://localhost:8000", "my-key") as c:
 **Формат основной строки:**
 
 ```
-2026-09-29 12:05:00.756 [INFO    ] screc.app.main: сообщение
+2026-09-30 12:05:00.756 [INFO    ] screc.app.main: сообщение
 ```
 
 **Формат access:**
 
 ```
-2026-09-29 12:05:00.756 [ACCESS] 172.18.0.1 POST /api/v1/records → 200 (45.2 ms) [a1b2c3d4]
+2026-09-30 12:05:00.756 [ACCESS] 172.18.0.1 POST /api/v1/records → 200 (45.2 ms) [a1b2c3d4]
 ```
 
-### 11.3. Проверка состояния
+**Записи про хэши:**
+
+```
+screc.app.records_service: Артефакт пропущен (sha256 совпал): record=..., kind=transcript, name=transcript.md, sha=abc123...
+screc.app.records_service: Артефакт сохранён: record=..., kind=transcript, name=transcript.md, size=12345, reason=artifact_absent, sha=def456...
+screc.app.api.artifacts: HEAD артефакта: record=..., name=transcript.md, exists=True, skip=True, reason=sha256_match
+```
+
+### 12.3. Проверка состояния
 
 ```bash
 # Health
@@ -1152,9 +1809,13 @@ tail -10 data/changelog.jsonl | jq
 
 # Размер индекса
 ls -lh data/fts.json
+
+# Артефакты с их хэшами
+jq '.artifacts[] | {filename, sha256, size}' \
+  "data/records/vNext/2026/09/2026-09-30 тест/_meta.json"
 ```
 
-### 11.4. Бэкап
+### 12.4. Бэкап
 
 ```bash
 tar czf screc-backup-$(date +%F).tar.gz data/
@@ -1162,7 +1823,7 @@ tar czf screc-backup-$(date +%F).tar.gz data/
 
 При остановленном контейнере — достаточно скопировать `data/`.
 
-### 11.5. Восстановление
+### 12.5. Восстановление
 
 ```bash
 tar xzf screc-backup-YYYY-MM-DD.tar.gz
@@ -1173,28 +1834,46 @@ docker compose restart
 
 ---
 
-## 12. Версионирование и совместимость
+## 13. Версионирование и совместимость
 
-### 12.1. Текущая версия
+### 13.1. Текущая версия
 
-`1.0.0` — API стабилен, breaking changes не планируются без мажорного бампа.
+`1.1.0` — добавлена проверка хэшей и условная загрузка.
+`1.0.0` — базовая версия API.
 
-### 12.2. Правила совместимости
+### 13.2. Правила совместимости
 
 - **Мажорная версия** — несовместимые изменения (переименование полей, изменение семантики action, смена схемы хранения).
 - **Минорная** — новые поля (клиенты их игнорируют), новые эндпоинты.
 - **Патч** — исправления.
 
-### 12.3. Что делать клиенту при обновлении сервера
+### 13.3. Что нового в 1.1.0
+
+| Изменение | Совместимость |
+|---|---|
+| Параметр `sha256` в `POST /records` | Обратно совместимо (опциональный) |
+| Параметр `sha256` в `POST /records/{id}/artifacts` | Обратно совместимо (опциональный) |
+| Поля `skipped_artifacts` / `uploaded_artifacts` в ответе | Обратно совместимо (клиенты игнорируют) |
+| `HEAD /records/{id}/artifacts/{filename}` | Новый эндпоинт |
+| `POST /records/{id}/artifacts/check` | Новый эндпоинт |
+| `DELETE /records/{id}/artifacts` | Новый эндпоинт |
+| `?hard=` в `DELETE /records/{id}/artifacts/{filename}` | Обратно совместимо (по умолчанию `true`) |
+| `entity: "artifact"` в `changelog` | Обратно совместимо (старые клиенты игнорируют) |
+| Поле `deleted_at` в `artifacts[]` | Обратно совместимо (по умолчанию `null`) |
+| Удаление артефакта теперь пишется в changelog | Обратно совместимо, но улучшает multi-client |
+
+### 13.4. Что делать клиенту при обновлении сервера
 
 - Читать `record.revision` — он всегда растёт.
 - Не полагаться на порядок полей в JSON.
 - Игнорировать незнакомые поля (FastAPI/Pydantic это позволяет).
 - Использовать `since_revision` для дельты, а `snapshot` — только при `last_synced_revision == 0`.
+- Обрабатывать `entity: "artifact"` в `changelog` (если пользуетесь синхронизацией).
 
-### 12.4. Обратная совместимость хранилища
+### 13.5. Обратная совместимость хранилища
 
 - Новые поля в `_meta.json` добавляются, старые не удаляются.
+- Поле `deleted_at` в `artifacts[]` — новое; старые записи читаются как `null`.
 - `_links.json` может содержать новые ключи (`audio`) — старые клиенты их игнорируют.
 - Формат `changelog.jsonl` append-only; старые события не переписываются.
 - При изменении формата `_meta.json` сервис мигрирует на чтении.
@@ -1217,13 +1896,16 @@ docker compose restart
 | POST | `/api/v1/records` | ✅ | Создать/обновить |
 | GET | `/api/v1/records/{id}` | ✅ | Получить |
 | PATCH | `/api/v1/records/{id}` | ✅ | Обновить поля |
-| DELETE | `/api/v1/records/{id}` | ✅ | Удалить |
+| DELETE | `/api/v1/records/{id}` | ✅ | Удалить запись |
 | GET | `/api/v1/records/{id}/video-url` | ✅ | Ссылка на видео |
 | PUT | `/api/v1/records/{id}/video-url` | ✅ | Обновить ссылку |
 | GET | `/api/v1/records/{id}/artifacts` | ✅ | Список артефактов |
 | GET | `/api/v1/records/{id}/artifacts/{filename}` | ✅ | Скачать |
+| HEAD | `/api/v1/records/{id}/artifacts/{filename}` | ✅ | Проверить перед загрузкой |
+| POST | `/api/v1/records/{id}/artifacts/check` | ✅ | Пакетная проверка |
 | POST | `/api/v1/records/{id}/artifacts` | ✅ | Загрузить |
-| DELETE | `/api/v1/records/{id}/artifacts/{filename}` | ✅ | Удалить |
+| DELETE | `/api/v1/records/{id}/artifacts/{filename}` | ✅ | Удалить артефакт |
+| DELETE | `/api/v1/records/{id}/artifacts` | ✅ | Удалить все артефакты |
 | GET | `/api/v1/records/{id}/transcript` | ✅ | Стенограмма |
 | GET | `/api/v1/records/{id}/summary` | ✅ | Summary |
 | GET | `/api/v1/records/_/search` | ✅ | Поиск |
@@ -1234,6 +1916,8 @@ docker compose restart
 
 ## Приложение B. Чек-лист интеграции
 
+### Базовый
+
 - [ ] Получить `SCREC_API_KEY` от администратора сервера.
 - [ ] Проверить `GET /health` — сервис жив.
 - [ ] Сделать пробный `GET /api/v1/tree` с ключом — 200.
@@ -1242,14 +1926,26 @@ docker compose restart
 - [ ] Реализовать первичную синхронизацию через `GET /api/v1/sync/snapshot`.
 - [ ] Сохранять `server_revision` в локальный файл.
 - [ ] Реализовать периодический `GET /api/v1/sync/changes`.
-- [ ] Обрабатывать `action` ∈ `{create, update, delete}`.
+- [ ] Обрабатывать `action` ∈ `{create, update, delete, update_links}`.
 - [ ] Обрабатывать `video_url` — не пытаться скачать видео, использовать ссылку.
 - [ ] Логировать HTTP-ошибки (особенно 401, 413, 500).
 - [ ] Настроить таймауты: connect 15 с, read ≥ 60 с (для загрузки больших файлов).
 - [ ] Обработать `has_more == true` в `/sync/changes`.
 
----
+### С хэшами
 
-**Конец документа.**
+- [ ] Реализовать подсчёт SHA-256 для файлов на клиенте.
+- [ ] Передавать `sha256` в `POST /records` (для идемпотентности).
+- [ ] Передавать `sha256` в `POST /records/{id}/artifacts` (для идемпотентности).
+- [ ] Использовать `HEAD /records/{id}/artifacts/{filename}` для условной загрузки.
+- [ ] Или использовать `POST /records/{id}/artifacts/check` для пакетной проверки.
+- [ ] Обрабатывать поле `skipped` в ответе.
+- [ ] Обрабатывать поле `reason` (см. §7.4).
 
-Если нужна документация в формате OpenAPI 3.1 (машинночитаемая) — она автоматически отдаётся сервисом по адресу `/openapi.json`. Можно скачать и импортировать в Postman/Insomnia/Swagger Editor.
+### С удалением и синхронизацией
+
+- [ ] Обрабатывать `entity: "artifact"` в `/sync/changes`.
+- [ ] При `artifact_delete`/`artifact_soft_delete`/`artifact_delete_all` перезагружать запись и синхронизировать локальные файлы.
+- [ ] Использовать `DELETE /records/{id}/artifacts/{filename}` для удаления одного.
+- [ ] Использовать `DELETE /records/{id}/artifacts` для массового удаления.
+- [ ] Использовать `?keep_kinds=transcript` для сохранения стенограммы.

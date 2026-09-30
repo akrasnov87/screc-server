@@ -61,6 +61,9 @@ class RecordResponse(BaseModel):
     action: str          # create / update
     path: str
     artifacts: List[ArtifactInfo]
+    # + ADDED: информация о пропущенных и загруженных артефактах
+    skipped_artifacts: List[ArtifactInfo] = Field(default_factory=list)
+    uploaded_artifacts: List[ArtifactInfo] = Field(default_factory=list)
 
 
 class RecordFull(BaseModel):
@@ -176,3 +179,31 @@ class HealthResponse(BaseModel):
     data_root: str
     fts_enabled: bool
     time: str
+
+
+# --- Проверка артефактов перед загрузкой --------------------------------
+class ArtifactCheckItem(BaseModel):
+    """Один файл для проверки."""
+    filename: str = Field(min_length=1, max_length=250)
+    sha256: Optional[str] = Field(default=None, max_length=64)
+
+
+class ArtifactCheckRequest(BaseModel):
+    """Пакетная проверка артефактов для одной записи."""
+    artifacts: List[ArtifactCheckItem] = Field(
+        default_factory=list, max_length=500
+    )
+
+
+class ArtifactCheckResult(BaseModel):
+    """Результат проверки одного файла."""
+    filename: str
+    sha256: str = ""
+    skip: bool = False
+    reason: str = ""
+    size: int = 0
+
+
+class ArtifactCheckResponse(BaseModel):
+    id: str
+    results: List[ArtifactCheckResult] = Field(default_factory=list)

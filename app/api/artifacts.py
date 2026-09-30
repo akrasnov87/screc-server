@@ -1,17 +1,29 @@
-"""Скачивание и загрузка артефактов."""
+"""Скачивание и загрузка артефактов.
+
+Поддерживает проверку SHA-256:
+  • POST /records/{id}/artifacts — загрузка с опциональным хэшем.
+  • HEAD /records/{id}/artifacts/{filename} — проверка, нужно ли
+    загружать файл (без передачи содержимого).
+  • POST /records/{id}/artifacts/check — пакетная проверка списка
+    файлов перед загрузкой.
+"""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import (
+    APIRouter, Depends, File, Form, Header, HTTPException,
+    Response, UploadFile, status,
+)
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from .. import records_service
-from ..atomic import atomic_write_bytes, read_json
+from ..atomic import atomic_write_json, read_json
 from ..auth import require_api_key
 from ..locks import write_lock
 from ..logger import get_logger
+from ..models import ArtifactCheckRequest, ArtifactCheckResponse
 
 router = APIRouter(
     prefix="/records",
@@ -31,6 +43,9 @@ def _safe_artifact_path(rdir: Path, filename: str) -> Path:
     return target
 
 
+# ---------------------------------------------------------------------------
+# Список артефактов
+# ---------------------------------------------------------------------------
 @router.get("/{record_id}/artifacts")
 async def list_artifacts(record_id: str) -> dict:
     rdir = records_service.find_by_id(record_id)
@@ -43,6 +58,9 @@ async def list_artifacts(record_id: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Скачивание
+# ---------------------------------------------------------------------------
 @router.get("/{record_id}/artifacts/{filename}")
 async def download_artifact(
     record_id: str,
@@ -66,44 +84,134 @@ async def download_artifact(
     )
 
 
+# ---------------------------------------------------------------------------
+# HEAD: проверка «нужно ли загружать файл»
+# ---------------------------------------------------------------------------
+@router.head("/{record_id}/artifacts/{filename}")
+async def head_artifact(
+    record_id: str,
+    filename: str,
+    x_content_sha256: Optional[str] = Header(
+        default=None, alias="X-Content-SHA256",
+    ),
+) -> Response:
+    """
+    Проверяет, нужно ли загружать файл, БЕЗ передачи содержимого.
+
+    Заголовки запроса:
+      • X-Content-SHA256 — опциональный хэш клиента.
+
+    Заголовки ответа:
+      • X-Artifact-Skip       — "true" | "false"
+      • X-Artifact-SHA256     — хэш существующего файла или ""
+      • X-Artifact-Size       — размер существующего файла или 0
+      • X-Artifact-Kind       — kind существующего файла или ""
+
+    Коды:
+      • 200 — артефакт существует (skip может быть true/false)
+      • 404 — артефакта нет, нужно загрузить
+    """
+    try:
+        result = records_service.check_artifact(
+            record_id=record_id,
+            filename=filename,
+            sha256_client=x_content_sha256,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            # записи нет — отдадим 404, клиент поймёт, что грузить
+            # некуда (но это не «файла нет»). Логируем отдельно.
+            log.info(
+                "HEAD артефакта: запись не найдена, id=%s", record_id
+            )
+        raise
+
+    headers = {
+        "X-Artifact-Skip": "true" if result["skip"] else "false",
+        "X-Artifact-SHA256": result.get("sha256", ""),
+        "X-Artifact-Size": str(result.get("size", 0)),
+        "X-Artifact-Kind": result.get("kind", ""),
+    }
+
+    if not result["exists"]:
+        # 404 без тела — HEAD-семантика
+        return Response(status_code=404, headers=headers)
+
+    log.debug(
+        "HEAD артефакта: record=%s, name=%s, exists=%s, skip=%s, "
+        "reason=%s",
+        record_id, filename, result["exists"], result["skip"],
+        result["reason"],
+    )
+    return Response(status_code=200, headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# POST: пакетная проверка
+# ---------------------------------------------------------------------------
+@router.post(
+    "/{record_id}/artifacts/check",
+    response_model=ArtifactCheckResponse,
+)
+async def check_artifacts_batch(
+    record_id: str,
+    body: ArtifactCheckRequest,
+) -> ArtifactCheckResponse:
+    """
+    Пакетная проверка списка файлов перед загрузкой.
+
+    Возвращает для каждого файла skip-флаг и reason.
+    Клиент должен отправить только те файлы, у которых skip=false.
+    """
+    if not body.artifacts:
+        return ArtifactCheckResponse(id=record_id, results=[])
+
+    items = [
+        {"filename": it.filename, "sha256": it.sha256}
+        for it in body.artifacts
+    ]
+    raw = records_service.check_artifacts_batch(
+        record_id=record_id, items=items,
+    )
+    return ArtifactCheckResponse(**raw)
+
+
+# ---------------------------------------------------------------------------
+# Загрузка одного артефакта
+# ---------------------------------------------------------------------------
 @router.post("/{record_id}/artifacts")
 async def upload_artifact(
     record_id: str,
     file: UploadFile = File(...),
-    kind: str = "attachment",
+    kind: str = Form("attachment"),
+    sha256: Optional[str] = Form(None),
 ) -> dict:
-    rdir = records_service.find_by_id(record_id)
-    if not rdir:
-        raise HTTPException(404, "Record not found")
+    """
+    Загружает один артефакт в существующую запись.
 
+    Если sha256 передан и совпадает с уже сохранённым файлом
+    с таким же именем — файл НЕ перезаписывается, возвращается
+    {"skipped": true}.
+    """
     content = await file.read()
     filename = Path(file.filename or "file").name
-    path = _safe_artifact_path(rdir, filename)
 
-    with write_lock():
-        atomic_write_bytes(path, content)
-        meta = read_json(rdir / "_meta.json", default={}) or {}
-        arts = list(meta.get("artifacts", []) or [])
-        # заменяем запись с тем же именем
-        arts = [a for a in arts if a.get("filename") != filename]
-        import hashlib
-        arts.append({
-            "kind": kind,
-            "filename": filename,
-            "size": len(content),
-            "sha256": hashlib.sha256(content).hexdigest(),
-        })
-        meta["artifacts"] = arts
-        from ..atomic import atomic_write_json
-        atomic_write_json(rdir / "_meta.json", meta)
+    sha_clean: Optional[str] = None
+    if sha256:
+        sha_clean = sha256.strip().lower() or None
 
-    log.info(
-        "Артефакт загружен: record=%s, kind=%s, name=%s, size=%d",
-        record_id, kind, filename, len(content),
+    return records_service.upload_single_artifact(
+        record_id=record_id,
+        kind=kind,
+        filename=filename,
+        content=content,
+        sha256_client=sha_clean,
     )
-    return {"id": record_id, "filename": filename, "size": len(content)}
 
 
+# ---------------------------------------------------------------------------
+# Удаление
+# ---------------------------------------------------------------------------
 @router.delete("/{record_id}/artifacts/{filename}")
 async def delete_artifact(record_id: str, filename: str) -> dict:
     rdir = records_service.find_by_id(record_id)
@@ -120,7 +228,6 @@ async def delete_artifact(record_id: str, filename: str) -> dict:
             if a.get("filename") != filename
         ]
         meta["artifacts"] = arts
-        from ..atomic import atomic_write_json
         atomic_write_json(rdir / "_meta.json", meta)
 
     log.info(
@@ -129,7 +236,9 @@ async def delete_artifact(record_id: str, filename: str) -> dict:
     return {"id": record_id, "filename": filename, "deleted": True}
 
 
-# --- Удобные шорткаты --------------------------------------------------
+# ---------------------------------------------------------------------------
+# Удобные шорткаты
+# ---------------------------------------------------------------------------
 @router.get(
     "/{record_id}/transcript",
     response_class=PlainTextResponse,
