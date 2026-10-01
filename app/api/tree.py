@@ -34,7 +34,6 @@ async def list_projects() -> List[TreeProject]:
             y.name for y in project_dir.iterdir()
             if y.is_dir() and not y.name.startswith(".")
         )
-        # посчитаем записи
         count = 0
         for y in project_dir.iterdir():
             if not y.is_dir():
@@ -107,6 +106,7 @@ async def list_records(
                 tags=list(meta.get("tags", []) or []),
                 has_summary=bool((meta.get("summary_bb") or "").strip()),
                 artifacts_count=len(meta.get("artifacts", []) or []),
+                sync_ready=bool(meta.get("sync_ready", False)),
             )
         )
     log.debug(

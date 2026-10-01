@@ -27,6 +27,9 @@ _decode_upload_filename декодирует их обратно в Unicode,
     (при первичном создании) обновляют индекс.
   • check_artifact проверяет наличие файла на диске
     (path.is_file()), а не только запись в _meta.json.
+  • Добавлен флаг sync_ready — признак «готово к синхронизации».
+    Сохраняется в _meta.json, читается build_full, может
+    меняться через PATCH /records/{id}.
 """
 from __future__ import annotations
 
@@ -178,6 +181,7 @@ def build_full(rdir: Path) -> Optional[RecordFull]:
         include_tags_in_prompt=bool(
             meta.get("include_tags_in_prompt", True)
         ),
+        sync_ready=bool(meta.get("sync_ready", False)),
         artifacts=[
             ArtifactInfo(**a) for a in meta.get("artifacts", []) or []
         ],
@@ -204,7 +208,6 @@ def find_by_id(record_id: str) -> Optional[Path]:
         candidate = settings.records_root / rel
         if (candidate / _META).is_file():
             return candidate
-        # Индекс указывает на несуществующую папку — устарел.
         log.warning(
             "Индекс указывает на несуществующую папку: %s "
             "(record_id=%s) — пересоберём",
@@ -220,7 +223,6 @@ def find_by_id(record_id: str) -> Optional[Path]:
             break
 
     if found is not None:
-        # Восстанавливаем индекс (под write_lock, чтобы не гонки).
         try:
             with write_lock():
                 records_index.add(record_id, _relative_path(found))
@@ -425,6 +427,9 @@ async def create_or_update(
             "include_comment_in_prompt": payload.include_comment_in_prompt,
             "include_tags_in_prompt": payload.include_tags_in_prompt,
 
+            # --- Флаг готовности к синхронизации ---
+            "sync_ready": bool(payload.sync_ready),
+
             "artifacts": artifacts_meta,
             "revision": 0,
             "deleted_at": None,
@@ -454,6 +459,7 @@ async def create_or_update(
                 "full": True,
                 "project": payload.project,
                 "date": payload.date,
+                "sync_ready": bool(payload.sync_ready),
                 "skipped_artifacts": [
                     a.get("filename") for a in skipped_artifacts
                 ],
@@ -605,9 +611,6 @@ def soft_delete(record_id: str, hard: bool = False) -> Dict[str, Any]:
         )
         meta["revision"] = rev
         atomic_write_json(rdir / _META, meta)
-
-        # Из индекса не удаляем — soft-delete можно откатить.
-        # find_by_id по-прежнему находит папку.
 
     log.warning(
         "SOFT DELETE: id=%s, path=%s, revision=%d",
@@ -776,14 +779,6 @@ def check_artifact(
     filename: str,
     sha256_client: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Проверяет, нужно ли загружать файл, не принимая его содержимое.
-
-    ВАЖНО: проверяет не только запись в _meta.json, но и наличие
-    файла на диске (path.is_file()). Если файл пропал (ручное
-    удаление, рассинхрон), HEAD вернёт exists=False — клиент
-    загрузит файл заново.
-    """
     rdir = find_by_id(record_id)
     if not rdir:
         raise HTTPException(404, f"Record not found: {record_id}")
@@ -807,7 +802,6 @@ def check_artifact(
             "kind": "",
         }
 
-    # --- Проверка фактического файла на диске ---
     artifact_path = rdir / safe_name
     if not artifact_path.is_file():
         log.warning(
@@ -854,18 +848,9 @@ def check_artifacts_batch(
     record_id: str,
     items: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    Пакетная проверка: возвращает список результатов,
-    по одному на каждый item.
-
-    Оптимизация: rdir ищется один раз, а не N раз через
-    check_artifact. Это важно — find_by_id хоть и стал O(1)
-    благодаря индексу, но лишние вызовы ни к чему.
-    """
     if not items:
         return {"id": record_id, "results": []}
 
-    # Один раз находим rdir.
     rdir = find_by_id(record_id)
     if not rdir:
         raise HTTPException(404, f"Record not found: {record_id}")
@@ -902,7 +887,6 @@ def check_artifacts_batch(
             })
             continue
 
-        # Проверка файла на диске.
         if not (rdir / safe_name).is_file():
             log.warning(
                 "check_artifacts_batch: файл отсутствует на диске: "

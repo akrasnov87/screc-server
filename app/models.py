@@ -42,6 +42,10 @@ class RecordPayload(BaseModel):
     include_comment_in_prompt: bool = True
     include_tags_in_prompt: bool = True
 
+    # --- Флаг «готово к синхронизации» ---
+    # Пока False — запись считается черновиком.
+    sync_ready: bool = False
+
     video_url: str = ""
     video_size: int = 0
     video_mime: str = ""
@@ -51,8 +55,8 @@ class RecordPayload(BaseModel):
 class ArtifactInfo(BaseModel):
     kind: str
     filename: str
-    size: int
-    sha256: str
+    size: int = 0
+    sha256: str = ""
 
 
 class RecordResponse(BaseModel):
@@ -61,7 +65,6 @@ class RecordResponse(BaseModel):
     action: str          # create / update
     path: str
     artifacts: List[ArtifactInfo]
-    # + ADDED: информация о пропущенных и загруженных артефактах
     skipped_artifacts: List[ArtifactInfo] = Field(default_factory=list)
     uploaded_artifacts: List[ArtifactInfo] = Field(default_factory=list)
 
@@ -100,6 +103,9 @@ class RecordFull(BaseModel):
     include_comment_in_prompt: bool
     include_tags_in_prompt: bool
 
+    # --- Флаг «готово к синхронизации» ---
+    sync_ready: bool = False
+
     artifacts: List[ArtifactInfo] = Field(default_factory=list)
     video: Optional[Dict[str, Any]] = None
 
@@ -121,6 +127,8 @@ class RecordPatch(BaseModel):
     prompt: Optional[str] = None
     prompt_name: Optional[str] = None
     prompt_edited: Optional[bool] = None
+    # --- Флаг «готово к синхронизации» ---
+    sync_ready: Optional[bool] = None
     video_url: Optional[str] = None
     video_size: Optional[int] = None
     video_mime: Optional[str] = None
@@ -146,6 +154,8 @@ class TreeRecord(BaseModel):
     tags: List[str] = Field(default_factory=list)
     has_summary: bool = False
     artifacts_count: int = 0
+    # --- Флаг «готово к синхронизации» ---
+    sync_ready: bool = False
 
 
 # --- Синхронизация ------------------------------------------------------
@@ -158,6 +168,9 @@ class SyncChange(BaseModel):
     path: str
     payload: Optional[Dict[str, Any]] = None
     old_path: Optional[str] = None
+    # --- Имя изменённого артефакта (для action=artifact_upload/delete) ---
+    filename: Optional[str] = None
+    kind: Optional[str] = None
 
 
 class SyncChangesResponse(BaseModel):
