@@ -104,6 +104,18 @@ def create_app() -> FastAPI:
         log.info("api_key set = %s", bool(settings.api_key))
         log.info("fts enabled = %s", settings.fts_enabled)
         log.info("openapi     = %s", settings.openapi_enabled)
+
+        # --- Инициализация индекса id → path ---
+        try:
+            from . import records_index
+            records_index.ensure_initialized()
+            log.info("Индекс записей готов")
+        except Exception as exc:
+            log.exception(
+                "Не удалось инициализировать индекс записей: %s",
+                exc,
+            )
+
         log.info("=" * 60)
 
     @app.on_event("shutdown")

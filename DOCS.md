@@ -20,6 +20,7 @@
 11. [Пример клиента на Python](#11-пример-клиента-на-python)
 12. [Эксплуатация](#12-эксплуатация)
 13. [Версионирование и совместимость](#13-версионирование-и-совместимость)
+14. [Известные ограничения и расхождения с реализацией](#14-известные-ограничения-и-расхождения-с-реализацией)
 
 ---
 
@@ -42,6 +43,10 @@
 - Не управляет правами — один API-ключ на весь сервис.
 - Не различает пользователей — вся модель под одного владельца.
 - Не делает глобальную дедупликацию по контенту (одинаковый файл под разными именами будет сохранён дважды).
+- **Не реализует soft-delete артефактов.** `DELETE /records/{id}/artifacts/{filename}` удаляет файл физически, без возможности восстановления.
+- **Не имеет эндпоинта массового удаления артефактов** (`DELETE /records/{id}/artifacts`). Удалять артефакты нужно по одному.
+- **Не пишет удаление артефактов в `changelog`.** `revision` не растёт при удалении артефакта, клиент B не узнает об удалении через `/sync/changes`.
+- **Не имеет эндпоинта перемещения записи** (`move`) между проектами/годами/месяцами.
 
 ### 1.3. Технологии
 
@@ -134,6 +139,7 @@ X-API-Key: <ключ>
   ```
 - Передавать только по HTTPS (в проде — за nginx/Traefik с TLS).
 - Не логировать значение ключа (сервер этого и не делает).
+- **Rate limiting не реализован.** При компрометации ключа нет защиты от перебора/флуда. Настоятельно рекомендуется ставить сервис за reverse-proxy с rate limiting (nginx `limit_req`, Traefik rate-limit middleware и т.п.).
 
 ---
 
@@ -198,7 +204,8 @@ X-API-Key: <ключ>
 | `filename` | string | Оригинальное имя файла |
 | `size` | int | Размер в байтах |
 | `sha256` | string | SHA-256 содержимого (считается сервером) |
-| `deleted_at` | string \| null | Если задано — артефакт помечен soft-deleted |
+
+> **Примечание.** Поле `deleted_at` у артефактов **не поддерживается**. Soft-delete артефактов не реализован: удаление всегда физическое.
 
 ### 4.4. `TreeRecord` — элемент списка в дереве
 
@@ -218,12 +225,15 @@ X-API-Key: <ключ>
 |---|---|---|
 | `rev` | int | Номер ревизии |
 | `ts` | string | ISO-8601 UTC |
-| `entity` | string | `"record"` или `"artifact"` |
+| `entity` | string | Всегда `"record"` (см. примечание ниже) |
 | `action` | string | см. таблицу ниже |
 | `id` | string | ID записи |
 | `path` | string | Относительный путь |
 | `payload` | object \| null | Метаданные изменения |
-| `old_path` | string \| null | Прежний путь (для `move`) |
+
+> **Примечание.** В текущей реализации `changelog` пишет **только** события с `entity: "record"`. События уровня артефактов (`artifact_upload`, `artifact_delete`, `artifact_delete_all`) **не пишутся**. Соответственно, удаление артефакта не инкрементирует `revision` и не появляется в `/sync/changes`.
+>
+> Поле `old_path` в `SyncChange` присутствует в модели, но всегда `null`: эндпоинта перемещения записи нет.
 
 **Значения `action`:**
 
@@ -233,10 +243,6 @@ X-API-Key: <ключ>
 | `record` | `update` | Обновлены поля записи |
 | `record` | `delete` | Удалена (soft или hard) |
 | `record` | `update_links` | Обновлена ссылка на видео/аудио |
-| `artifact` | `artifact_upload` | Загружен новый/обновлённый артефакт |
-| `artifact` | `artifact_delete` | Удалён артефакт (физически) |
-| `artifact` | `artifact_soft_delete` | Помечен как удалённый |
-| `artifact` | `artifact_delete_all` | Удалены все артефакты записи |
 
 ### 4.6. `ArtifactCheckItem` / `ArtifactCheckResult`
 
@@ -329,8 +335,7 @@ X-API-Key: <ключ>
       "kind": "transcript",
       "filename": "transcript_запись.md",
       "size": 45678,
-      "sha256": "abc123...",
-      "deleted_at": null
+      "sha256": "abc123..."
     }
   ],
   "revision": 101,
@@ -341,7 +346,7 @@ X-API-Key: <ключ>
 **Про `artifacts[]`:**
 
 - `sha256` — сервер считает сам, всегда.
-- `deleted_at` — `null` для живых артефактов; ISO-таймстемп, если soft-deleted.
+- Поля `deleted_at` у артефактов **нет**.
 
 ### 5.4. Формат `_links.json`
 
@@ -367,10 +372,10 @@ X-API-Key: <ключ>
 ```jsonl
 {"rev":1,"ts":"...","entity":"record","action":"create","id":"770e...","path":"vNext/2026/09/...","payload":{"full":true,"project":"vNext","date":"2026-09-08","skipped_artifacts":[],"uploaded_artifacts":["transcript.md"]}}
 {"rev":2,"ts":"...","entity":"record","action":"update","id":"770e...","path":"vNext/2026/09/...","payload":{"changed":["summary_bb","tags"]}}
-{"rev":3,"ts":"...","entity":"artifact","action":"artifact_upload","id":"770e...","path":"vNext/2026/09/...","payload":{"filename":"transcript.md","kind":"transcript","size":12345,"sha256":"abc...","reason":"artifact_absent"}}
-{"rev":4,"ts":"...","entity":"artifact","action":"artifact_delete","id":"770e...","path":"vNext/2026/09/...","payload":{"filename":"transcript.md","hard":true}}
 {"rev":5,"ts":"...","entity":"record","action":"delete","id":"770e...","path":"vNext/2026/09/..."}
 ```
+
+> **Примечание.** В текущей реализации changelog содержит только события `entity: "record"`. События загрузки/удаления артефактов отдельными записями не пишутся (за исключением упоминания имён артефактов в `payload.skipped_artifacts` / `payload.uploaded_artifacts` при `create`/`update`).
 
 ---
 
@@ -394,6 +399,8 @@ X-API-Key: <ключ>
   "time": "2026-09-30T12:05:00+00:00"
 }
 ```
+
+> **Примечание.** `records_count` вычисляется через `rglob("_meta.json")` при каждом запросе. На больших объёмах это дорого. Для частых health-проверок рекомендуется использовать `GET /health` верхнего уровня (см. §2.2) — он возвращает только `status`, `service`, `time` без обхода дерева.
 
 ---
 
@@ -533,6 +540,8 @@ X-API-Key: <ключ>
 
 **Ошибки:** `404`.
 
+> **Примечание.** Поля `project`, `year`, `month`, `folder_name` через `PATCH` изменить нельзя — их смена потребовала бы перемещения папки, а эндпоинта перемещения нет.
+
 ---
 
 #### `DELETE /records/{record_id}` — удаление записи
@@ -555,7 +564,7 @@ X-API-Key: <ключ>
 
 Soft-delete: запись исключается из `/tree`, но остаётся на диске. Событие `delete` пишется в `changelog`.
 
-**Идемпотентность:** повторный soft-delete возвращает `reason: "already_deleted"` и не создаёт новую ревизию.
+> **Примечание.** Повторный soft-delete **не идемпотентен**: каждый вызов создаёт новую ревизию и перезаписывает `_deleted.json` / `_meta.json`. Проверки `is_deleted()` перед удалением в коде нет.
 
 ---
 
@@ -612,14 +621,11 @@ Soft-delete: запись исключается из `/tree`, но остаёт
       "kind": "transcript",
       "filename": "transcript_запись.md",
       "size": 45678,
-      "sha256": "abc123...",
-      "deleted_at": null
+      "sha256": "abc123..."
     }
   ]
 }
 ```
-
-Soft-deleted артефакты тоже присутствуют, но с полем `deleted_at`.
 
 ---
 
@@ -640,6 +646,10 @@ Soft-deleted артефакты тоже присутствуют, но с по�
 ```
 GET /api/v1/records/770e.../artifacts/ПРОТОКОЛ%20СОВЕЩАНИЯ%20от%201%20сентября%202026.docx
 ```
+
+> **Безопасность.** Сервер **не проверяет** `Content-Type` отдаваемых файлов и **не выставляет** `X-Content-Type-Options: nosniff`. Если клиент загрузит `.html`-артефакт и откроет его в браузере напрямую (`inline`), возможен stored XSS. Рекомендуется:
+> - всегда использовать `?inline=false` для недоверенных файлов;
+> - либо настроить reverse-proxy с `X-Content-Type-Options: nosniff` и `Content-Security-Policy`.
 
 ---
 
@@ -670,6 +680,8 @@ GET /api/v1/records/770e.../artifacts/ПРОТОКОЛ%20СОВЕЩАНИЯ%20о
 | `200 OK` + `X-Artifact-Skip: false` | Файл есть, хэш не совпал (или не передан) | Грузить (перезапишет) |
 | `404 Not Found` | Файла нет | Грузить |
 | `404 Not Found` (запись не найдена) | Записи с таким id нет | Сначала создать запись |
+
+> **Примечание.** `HEAD` проверяет наличие артефакта в `_meta.json`, **не** наличие файла на диске. Если файл был удалён вручную (без правки `_meta.json`), `HEAD` вернёт `200 / skip=true`, но фактически файла на сервере не будет. Это ограничение текущей реализации.
 
 **Пример:**
 
@@ -727,6 +739,8 @@ X-Artifact-Kind: transcript
 
 **Ошибки:** `404` — запись не найдена.
 
+> **Примечание.** Внутри `check_artifacts_batch` вызывается `check_artifact` для каждого item, а тот каждый раз делает полный обход дерева `find_by_id`. Для 500 items — 500 обходов. На больших объёмах это медленно; учитывайте при интеграции.
+
 ---
 
 #### `POST /records/{record_id}/artifacts` — загрузить артефакт
@@ -769,102 +783,30 @@ X-Artifact-Kind: transcript
 
 #### `DELETE /records/{record_id}/artifacts/{filename}` — удалить артефакт
 
-**Query-параметры:**
+Удаляет файл **физически** и убирает его из `_meta.json`.
 
-| Имя | Тип | По умолчанию | Описание |
-|---|---|---|---|
-| `hard` | bool | `true` | `true` — удалить файл с диска. `false` — soft-delete (файл остаётся, но помечается). |
-
-**Ответ 200 (успешно удалён):**
-
-```json
-{
-  "id": "770e8400-...",
-  "filename": "transcript.md",
-  "deleted": true,
-  "hard": true,
-  "revision": 105,
-  "reason": "deleted"
-}
-```
-
-**Ответ 200 (файла не было — идемпотентно):**
-
-```json
-{
-  "id": "770e8400-...",
-  "filename": "transcript.md",
-  "deleted": false,
-  "hard": true,
-  "revision": 105,
-  "reason": "already_absent"
-}
-```
-
-**Возможные `reason`:**
-
-| Значение | Описание |
-|---|---|
-| `deleted` | Удалено |
-| `already_absent` | Файла не было |
-| `already_deleted` | Уже был soft-deleted |
-
-**Важно:** удаление пишется в `changelog` и инкрементирует `revision`. Клиент B, синхронизирующийся через `/sync/changes`, увидит событие `entity: "artifact"` и сможет удалить файл у себя.
-
----
-
-#### `DELETE /records/{record_id}/artifacts` — удалить все артефакты записи
-
-**Query-параметры:**
-
-| Имя | Тип | По умолчанию | Описание |
-|---|---|---|---|
-| `hard` | bool | `true` | `true` — удалить физически. `false` — soft-delete. |
-| `keep_kinds` | string[] | `[]` | Список kind, которые **не** удалять (например, `transcript`, `summary`). |
-
-**Примеры:**
-
-```bash
-# Удалить всё
-DELETE /records/{id}/artifacts
-
-# Только пометить
-DELETE /records/{id}/artifacts?hard=false
-
-# Удалить всё, кроме стенограммы и summary
-DELETE /records/{id}/artifacts?keep_kinds=transcript&keep_kinds=summary
-```
+**Query-параметры:** нет.
 
 **Ответ 200:**
 
 ```json
 {
   "id": "770e8400-...",
-  "deleted_count": 4,
-  "deleted_filenames": [
-    "protocol.docx",
-    "deepseek_prompt.md",
-    "attachment.pdf",
-    "manual_protocol.md"
-  ],
-  "hard": true,
-  "revision": 107
+  "filename": "transcript.md",
+  "deleted": true
 }
 ```
 
-Если нечего удалять:
+**Ошибки:** `404` — запись не найдена.
 
-```json
-{
-  "id": "770e8400-...",
-  "deleted_count": 0,
-  "deleted_filenames": [],
-  "hard": true,
-  "revision": 107
-}
-```
-
-**Важно:** пишется в `changelog` как `entity: "artifact"`, `action: "artifact_delete_all"`.
+> **Важно.** Удаление артефакта:
+> - **не** пишется в `changelog`;
+> - **не** инкрементирует `revision`;
+> - **не** появляется в `/sync/changes`.
+>
+> Это означает, что клиент B, синхронизирующийся через `/sync/changes`, **не узнает** об удалении артефакта, пока не перезагрузит запись целиком. Если multi-client синхронизация с удалением артефактов важна — эту функциональность нужно доработать.
+>
+> Эндпоинта массового удаления (`DELETE /records/{id}/artifacts`) **нет**. Удалять артефакты нужно по одному.
 
 ---
 
@@ -921,6 +863,8 @@ DELETE /records/{id}/artifacts?keep_kinds=transcript&keep_kinds=summary
 
 **Что индексируется:** `summary_bb`, `comment`, `prompt`, `name`, а также содержимое артефактов с `kind` ∈ `{transcript, protocol, manual_protocol}` (если файл < 2 МБ).
 
+> **Примечание.** Записи, помеченные soft-delete (`_deleted.json`), **не фильтруются** в результатах поиска. Если это критично — доработайте `fts.search` или удаляйте запись из индекса при soft-delete.
+
 ---
 
 ### 6.6. Синхронизация
@@ -955,28 +899,23 @@ DELETE /records/{id}/artifacts?keep_kinds=transcript&keep_kinds=summary
         "skipped_artifacts": [],
         "uploaded_artifacts": ["transcript.md"]
       }
-    },
-    {
-      "rev": 105,
-      "ts": "2026-09-30T12:10:00+00:00",
-      "entity": "artifact",
-      "action": "artifact_delete",
-      "id": "770e8400-...",
-      "path": "vNext/2026/09/2026-09-08 формирование...",
-      "payload": {"filename": "protocol.docx", "hard": true}
     }
   ]
 }
 ```
 
+> **Важно.** Поле `server_revision` вычисляется как **максимум из `rev` выданных изменений**, а не как текущая ревизия сервера. Если с момента `since_revision` не было изменений, вернётся `since_revision`, а не актуальная ревизия. Клиент, у которого `since_revision=5`, а сервер уже на 100, получит `server_revision=5`. Это безопасно (повторный запрос с `since_revision=5` вернёт те же 0 изменений), но может ввести в заблуждение. Учитывайте это при логике опроса.
+
 **Алгоритм клиента:**
 1. Хранить `last_synced_revision` локально.
 2. Запрашивать `changes?since_revision=<last_synced_revision>`.
 3. Применять изменения:
-   - `entity: "record"` → применить запись целиком (скачать `GET /records/{id}`).
-   - `entity: "artifact"` → перезагрузить запись и привести локальные файлы в соответствие (удалить то, чего нет на сервере; скачать недостающие).
+   - `entity: "record"`, `action: "delete"` → удалить (или пометить) локальную папку.
+   - `entity: "record"`, `action: "create" / "update" / "update_links"` → скачать `GET /records/{id}` и применить локально.
 4. Обновить `last_synced_revision = server_revision`.
 5. Если `has_more == true` — повторить с новым `since_revision`.
+
+> **Примечание.** Изменения уровня артефактов (`artifact_upload`, `artifact_delete`, `artifact_delete_all`) в `changelog` **не пишутся**. Клиент не узнает об изменении отдельного артефакта, пока не перезагрузит запись целиком по какому-то другому событию.
 
 ---
 
@@ -995,6 +934,8 @@ DELETE /records/{id}/artifacts?keep_kinds=transcript&keep_kinds=summary
 ```
 
 Используется при **первой** синхронизации (когда `last_synced_revision = 0` и `changes` не подходит).
+
+> **Примечание.** `snapshot` читает **все** `_meta.json` и `_links.json` из дерева. При 10 000 записей это тяжёлый запрос. Рекомендуется выполнять его редко (при первой синхронизации) и не использовать как периодический.
 
 ---
 
@@ -1266,8 +1207,6 @@ for rec in snap["records"]:
     # 1. Создать папку rec["path"] в локальном хранилище
     # 2. Скачать все артефакты
     for art in rec["artifacts"]:
-        if art.get("deleted_at"):
-            continue
         url = f"{BASE}/api/v1/records/{rec['id']}/artifacts/{quote(art['filename'])}"
         content = requests.get(url, headers=HEADERS).content
         # сохранить по локальному пути
@@ -1276,7 +1215,7 @@ for rec in snap["records"]:
 state["last_synced_revision"] = snap["server_revision"]
 ```
 
-### 8.5. Инкрементальная синхронизация (с учётом удалений артефактов)
+### 8.5. Инкрементальная синхронизация
 
 ```python
 while True:
@@ -1289,7 +1228,7 @@ while True:
     for ch in r["changes"]:
         if ch["entity"] == "record":
             if ch["action"] == "delete":
-                # удалить локальную папку
+                # удалить локальную папку (или пометить)
                 pass
             else:
                 # скачать запись через GET /records/{id}
@@ -1297,14 +1236,6 @@ while True:
                     f"{BASE}/api/v1/records/{ch['id']}", headers=HEADERS
                 ).json()
                 apply_record_locally(rec)
-        elif ch["entity"] == "artifact":
-            # перезагрузить запись и привести локальные файлы
-            # в соответствие: удалить то, чего нет на сервере,
-            # скачать недостающие
-            rec = requests.get(
-                f"{BASE}/api/v1/records/{ch['id']}", headers=HEADERS
-            ).json()
-            reconcile_artifacts_locally(rec)
 
     state["last_synced_revision"] = r["server_revision"]
     if not r["has_more"]:
@@ -1312,6 +1243,8 @@ while True:
 
 # сохранить state["last_synced_revision"] на диск
 ```
+
+> **Важно.** Удаление артефактов **не появляется** в `/sync/changes`. Чтобы узнать об удалении отдельного артефакта, клиент должен периодически перезагружать запись целиком (`GET /records/{id}`) и сравнивать список `artifacts` с локальным.
 
 ### 8.6. Обновление summary без перезагрузки файлов
 
@@ -1334,14 +1267,24 @@ requests.delete(
 )
 ```
 
+> **Помните:** удаление не пишется в `changelog` и не инкрементирует `revision`. Другие клиенты об этом не узнают через `/sync/changes`.
+
 ### 8.8. Удалить все артефакты, кроме стенограммы
 
+**Не реализовано.** Эндпоинта `DELETE /records/{id}/artifacts` нет. Удаляйте артефакты по одному, перебирая список из `GET /records/{id}/artifacts`.
+
 ```python
-requests.delete(
-    f"{BASE}/api/v1/records/{record_id}/artifacts",
-    headers=HEADERS,
-    params={"keep_kinds": ["transcript"], "hard": True},
-)
+artifacts = requests.get(
+    f"{BASE}/api/v1/records/{record_id}/artifacts", headers=HEADERS
+).json()["items"]
+
+for art in artifacts:
+    if art["kind"] == "transcript":
+        continue
+    requests.delete(
+        f"{BASE}/api/v1/records/{record_id}/artifacts/{quote(art['filename'])}",
+        headers=HEADERS,
+    )
 ```
 
 ---
@@ -1429,6 +1372,12 @@ requests.delete(
 - 64 символа.
 - Регистр и пробелы нормализуются.
 - Пустая строка = «не передан».
+
+### 10.3. Прочие лимиты, о которых стоит помнить
+
+- **Нет лимита на количество артефактов в записи** при загрузке через `POST /records` (лимит 500 применяется только к `POST /records/{id}/artifacts/check`). На практике запись может накопить сколько угодно артефактов.
+- **Нет rate limiting.** Рекомендуется ставить за reverse-proxy.
+- **`upload_artifact` читает файл целиком в память** (`await file.read()`) перед проверкой размера. Для файлов близко к лимиту это может быть заметно по RAM.
 
 ---
 
@@ -1547,6 +1496,13 @@ class ScrecClient:
         return r.json()
 
     # --- Артефакты ---
+    def list_artifacts(self, record_id: str) -> dict:
+        r = self.client.get(
+            f"/api/v1/records/{record_id}/artifacts"
+        )
+        r.raise_for_status()
+        return r.json()
+
     def download_artifact(
         self, record_id: str, filename: str, target: Path
     ) -> Path:
@@ -1650,27 +1606,16 @@ class ScrecClient:
         self,
         record_id: str,
         filename: str,
-        hard: bool = True,
     ) -> dict:
+        """
+        Удаляет один артефакт (физически).
+
+        Внимание: удаление не пишется в changelog и не
+        инкрементирует revision. Другие клиенты об этом
+        не узнают через /sync/changes.
+        """
         r = self.client.delete(
             f"/api/v1/records/{record_id}/artifacts/{quote(filename)}",
-            params={"hard": hard},
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def delete_all_artifacts(
-        self,
-        record_id: str,
-        hard: bool = True,
-        keep_kinds: Optional[list[str]] = None,
-    ) -> dict:
-        params: list[tuple[str, str]] = [("hard", str(hard).lower())]
-        for k in (keep_kinds or []):
-            params.append(("keep_kinds", k))
-        r = self.client.delete(
-            f"/api/v1/records/{record_id}/artifacts",
-            params=params,
         )
         r.raise_for_status()
         return r.json()
@@ -1795,7 +1740,7 @@ screc.app.api.artifacts: HEAD артефакта: record=..., name=transcript.md
 ### 12.3. Проверка состояния
 
 ```bash
-# Health
+# Health (без обхода дерева)
 curl -s http://localhost:8000/health | jq
 
 # Количество записей на диске
@@ -1832,6 +1777,23 @@ docker compose restart
 
 Если FTS-индекс рассинхронизировался (редкий случай) — удалите `data/fts.json` и перезапустите сервис. Индекс пересоберётся при следующей публикации/обновлении.
 
+### 12.6. Производительность: на что обратить внимание
+
+- **`find_by_id` обходит всё дерево** на каждый вызов. Это затрагивает `GET /records/{id}`, `PATCH`, `DELETE`, `HEAD /artifacts/...`, `POST /artifacts/check` (для каждого item). При сотнях записей это терпимо, при тысячах — заметно. Если ожидается большой объём — рассмотрите добавление индекса `id → path`.
+- **`GET /api/v1/health`** (с `records_count`) делает `rglob` по дереву. Не вызывайте его часто; используйте `GET /health` (без авторизации) — он дешёвый.
+- **FTS** читает `fts.json` целиком при каждом поиске. При индексе в десятки МБ это заметно.
+- **`/sync/snapshot`** читает все `_meta.json` и `_links.json`. Используйте только при первой синхронизации.
+
+### 12.7. Безопасность
+
+- **API-ключ** сравнивается через `hmac.compare_digest` — защита от timing-атак.
+- **Path traversal** закрыт на двух уровнях (`_safe_segment` + `assert_inside`).
+- **Rate limiting не реализован.** Рекомендуется ставить сервис за reverse-proxy с ограничением скорости.
+- **MIME-валидации нет.** `FileResponse` отдаёт файл с `Content-Disposition: inline` и без `X-Content-Type-Options: nosniff`. Если сервис доступен в браузере, злоумышленник может загрузить `.html` и добиться stored XSS. Решения:
+  - отдавать все артефакты с `?inline=false` (`Content-Disposition: attachment`);
+  - либо настроить reverse-proxy с `X-Content-Type-Options: nosniff` и строгим CSP.
+- **CORS** настроен как `allow_origins=["*"]` без `allow_credentials`. Для внутреннего сервиса приемлемо, в проде лучше ограничить список origins.
+
 ---
 
 ## 13. Версионирование и совместимость
@@ -1856,11 +1818,6 @@ docker compose restart
 | Поля `skipped_artifacts` / `uploaded_artifacts` в ответе | Обратно совместимо (клиенты игнорируют) |
 | `HEAD /records/{id}/artifacts/{filename}` | Новый эндпоинт |
 | `POST /records/{id}/artifacts/check` | Новый эндпоинт |
-| `DELETE /records/{id}/artifacts` | Новый эндпоинт |
-| `?hard=` в `DELETE /records/{id}/artifacts/{filename}` | Обратно совместимо (по умолчанию `true`) |
-| `entity: "artifact"` в `changelog` | Обратно совместимо (старые клиенты игнорируют) |
-| Поле `deleted_at` в `artifacts[]` | Обратно совместимо (по умолчанию `null`) |
-| Удаление артефакта теперь пишется в changelog | Обратно совместимо, но улучшает multi-client |
 
 ### 13.4. Что делать клиенту при обновлении сервера
 
@@ -1868,15 +1825,56 @@ docker compose restart
 - Не полагаться на порядок полей в JSON.
 - Игнорировать незнакомые поля (FastAPI/Pydantic это позволяет).
 - Использовать `since_revision` для дельты, а `snapshot` — только при `last_synced_revision == 0`.
-- Обрабатывать `entity: "artifact"` в `changelog` (если пользуетесь синхронизацией).
+- Не полагаться на события артефактов в `changelog` — их там нет.
+- Периодически перезагружать запись целиком, чтобы увидеть удаления артефактов.
 
 ### 13.5. Обратная совместимость хранилища
 
 - Новые поля в `_meta.json` добавляются, старые не удаляются.
-- Поле `deleted_at` в `artifacts[]` — новое; старые записи читаются как `null`.
-- `_links.json` может содержать новые ключи (`audio`) — старые клиенты их игнорируют.
 - Формат `changelog.jsonl` append-only; старые события не переписываются.
 - При изменении формата `_meta.json` сервис мигрирует на чтении.
+
+---
+
+## 14. Известные ограничения и расхождения с реализацией
+
+Этот раздел — честный список того, что **не реализовано** или работает **не так, как ожидается**. Если какой-то из пунктов критичен для вашей интеграции — сначала доработайте сервер.
+
+### 14.1. Не реализовано
+
+| Что | Где упоминалось | Статус |
+|---|---|---|
+| `DELETE /records/{id}/artifacts` (массовое удаление с `keep_kinds`, `hard`) | Ранее в §6.4 | **Нет** в коде |
+| `?hard=` у `DELETE /records/{id}/artifacts/{filename}` | Ранее в §6.4 | **Нет**; всегда физическое удаление |
+| Soft-delete артефактов (`deleted_at` у `ArtifactInfo`) | Ранее в §4.3 | **Нет** |
+| Запись удаления артефакта в `changelog` (`entity: "artifact"`) | Ранее в §4.5 | **Нет** |
+| `action: "move"`, `old_path` | Ранее в §4.5 | **Нет**; эндпоинта перемещения нет |
+| Идемпотентный soft-delete записи (`reason: "already_deleted"`) | Ранее в §6.3 | **Нет**; повторный soft-delete создаёт новую ревизию |
+| Rate limiting | — | **Нет** |
+| MIME-валидация артефактов | — | **Нет** |
+| `X-Content-Type-Options: nosniff` | — | **Нет** |
+
+### 14.2. Работает, но с оговорками
+
+| Что | Оговорка |
+|---|---|
+| `server_revision` в `/sync/changes` | Возвращается максимум по выданным изменениям, а не текущая ревизия сервера |
+| `check_artifact` | Проверяет наличие артефакта в `_meta.json`, **не** наличие файла на диске |
+| `records_count` в `GET /api/v1/health` | Вычисляется через `rglob` при каждом запросе |
+| FTS-поиск | Возвращает soft-deleted записи (в `tree` они скрыты, в поиске — нет) |
+| `POST /records/{id}/artifacts/check` | Для N items делает N обходов дерева (`find_by_id`) |
+| `upload_artifact` | Читает файл в память целиком перед проверкой размера |
+| `main.py` | Использует deprecated `@app.on_event("startup"/"shutdown")` вместо `lifespan` |
+
+### 14.3. Что стоит доработать в первую очередь
+
+1. **Индекс `id → path`** — ускорить `find_by_id`.
+2. **Запись событий артефактов в `changelog`** — иначе multi-client синхронизация удалений артефактов не работает.
+3. **Проверка `path.is_file()` в `check_artifact`** — иначе клиент может «пропустить» файл, которого на сервере нет.
+4. **Чтение `upload_artifact` чанками** — вместо `await file.read()` целиком.
+5. **`server_revision = get_revision()`** в `/sync/changes` — вместо максимума по выданным.
+6. **Идемпотентность `soft_delete`** — проверка `is_deleted()` перед удалением.
+7. **MIME-валидация и `nosniff`** — безопасность при работе через браузер.
 
 ---
 
@@ -1884,11 +1882,11 @@ docker compose restart
 
 | Метод | Путь | Авторизация | Назначение |
 |---|---|---|---|
-| GET | `/health` | ❌ | Проверка живости |
+| GET | `/health` | ❌ | Проверка живости (без обхода дерева) |
 | GET | `/docs` | ❌ | Swagger UI |
 | GET | `/redoc` | ❌ | ReDoc |
 | GET | `/openapi.json` | ❌ | OpenAPI-схема |
-| GET | `/api/v1/health` | ✅ | Дублирует `/health` |
+| GET | `/api/v1/health` | ✅ | Расширенная проверка (с `records_count`) |
 | GET | `/api/v1/tree` | ✅ | Список проектов |
 | GET | `/api/v1/tree/{project}` | ✅ | Годы проекта |
 | GET | `/api/v1/tree/{project}/{year}` | ✅ | Месяцы |
@@ -1905,7 +1903,6 @@ docker compose restart
 | POST | `/api/v1/records/{id}/artifacts/check` | ✅ | Пакетная проверка |
 | POST | `/api/v1/records/{id}/artifacts` | ✅ | Загрузить |
 | DELETE | `/api/v1/records/{id}/artifacts/{filename}` | ✅ | Удалить артефакт |
-| DELETE | `/api/v1/records/{id}/artifacts` | ✅ | Удалить все артефакты |
 | GET | `/api/v1/records/{id}/transcript` | ✅ | Стенограмма |
 | GET | `/api/v1/records/{id}/summary` | ✅ | Summary |
 | GET | `/api/v1/records/_/search` | ✅ | Поиск |
@@ -1944,8 +1941,9 @@ docker compose restart
 
 ### С удалением и синхронизацией
 
-- [ ] Обрабатывать `entity: "artifact"` в `/sync/changes`.
-- [ ] При `artifact_delete`/`artifact_soft_delete`/`artifact_delete_all` перезагружать запись и синхронизировать локальные файлы.
-- [ ] Использовать `DELETE /records/{id}/artifacts/{filename}` для удаления одного.
-- [ ] Использовать `DELETE /records/{id}/artifacts` для массового удаления.
-- [ ] Использовать `?keep_kinds=transcript` для сохранения стенограммы.
+- [ ] Обрабатывать `entity: "record"`, `action: "delete"` в `/sync/changes`.
+- [ ] Удалять артефакты по одному через `DELETE /records/{id}/artifacts/{filename}`.
+- [ ] **Учитывать, что удаление артефактов не пишется в `changelog`.** Для multi-client синхронизации удалений — периодически перезагружать запись целиком и сравнивать список артефактов с локальным.
+- [ ] **Учитывать, что эндпоинта массового удаления (`DELETE /records/{id}/artifacts`) нет.** Удалять по одному.
+- [ ] **Учитывать, что soft-delete артефактов не реализован.** Все удаления — физические.
+```

@@ -11,6 +11,22 @@
 
 Серверный хэш (посчитанный из фактического содержимого) всегда
 является источником истины и сохраняется в _meta.json.
+
+Имена файлов от клиентов могут приходить percent-encoded
+(например, %D0%9B%D0%AD.xlsx) — aiohttp и некоторые другие
+HTTP-клиенты кодируют не-ASCII в Content-Disposition. Функция
+_decode_upload_filename декодирует их обратно в Unicode,
+чтобы файлы на диске сохранялись с оригинальными именами.
+
+Изменения:
+  • find_by_id теперь использует индекс records_index.json
+    (id → relative_path) вместо rglob по всему дереву.
+    Если id нет в индексе — fallback на старый rglob с
+    восстановлением индекса.
+  • create_or_update / soft_delete (hard) / patch_record
+    (при первичном создании) обновляют индекс.
+  • check_artifact проверяет наличие файла на диске
+    (path.is_file()), а не только запись в _meta.json.
 """
 from __future__ import annotations
 
@@ -20,10 +36,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 from fastapi import HTTPException
 
 from . import fts
+from . import records_index
 from .atomic import (
     atomic_write_bytes,
     atomic_write_json,
@@ -63,6 +81,37 @@ def _normalize_sha256(value: Optional[str]) -> Optional[str]:
         return None
     s = value.strip().lower()
     return s or None
+
+
+def _decode_upload_filename(raw: str) -> str:
+    """
+    Декодирует percent-encoding в имени файла от клиента.
+
+    aiohttp (и некоторые другие HTTP-клиенты) кодируют не-ASCII
+    имена в Content-Disposition по RFC 3986. starlette/FastAPI
+    отдают filename как есть, поэтому нужно декодировать вручную.
+    """
+    if not raw:
+        return raw
+
+    decoded = raw
+    for _ in range(3):
+        try:
+            new_val = unquote(decoded, errors="replace")
+        except Exception:
+            break
+        if new_val == decoded:
+            break
+        decoded = new_val
+
+    return Path(decoded).name
+
+
+def _relative_path(rdir: Path) -> str:
+    """Относительный путь rdir от records_root, с /."""
+    return str(rdir.relative_to(settings.records_root)).replace(
+        "\\", "/"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -140,17 +189,47 @@ def find_by_id(record_id: str) -> Optional[Path]:
     """
     Ищет папку записи по id.
 
-    Полный обход дерева — приемлемо, потому что пользователь один
-    и записей немного (тысячи, не миллионы). Кэш можно добавить
-    позже, если станет узким местом.
+    Основной путь — индекс records_index.json (O(1)).
+    Если id в индексе нет — fallback на обход дерева
+    (на случай рассинхрона) с восстановлением индекса.
     """
+    if not record_id:
+        return None
     if not settings.records_root.is_dir():
         return None
+
+    # --- Быстрый путь: индекс ---
+    rel = records_index.get_path(record_id)
+    if rel:
+        candidate = settings.records_root / rel
+        if (candidate / _META).is_file():
+            return candidate
+        # Индекс указывает на несуществующую папку — устарел.
+        log.warning(
+            "Индекс указывает на несуществующую папку: %s "
+            "(record_id=%s) — пересоберём",
+            candidate, record_id,
+        )
+
+    # --- Медленный путь: обход дерева (fallback) ---
+    found: Optional[Path] = None
     for meta_path in settings.records_root.rglob(_META):
         meta = read_json(meta_path, default={}) or {}
         if meta.get("id") == record_id:
-            return meta_path.parent
-    return None
+            found = meta_path.parent
+            break
+
+    if found is not None:
+        # Восстанавливаем индекс (под write_lock, чтобы не гонки).
+        try:
+            with write_lock():
+                records_index.add(record_id, _relative_path(found))
+        except Exception as exc:
+            log.warning(
+                "Не удалось обновить индекс после fallback: %s", exc
+            )
+
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -178,13 +257,6 @@ def _should_skip_upload(
     Возвращает (skip, reason):
       • skip=True  — файл уже есть с таким хэшем, перезапись не нужна;
       • skip=False — нужно записать файл (причина в reason).
-
-    Правила:
-      1) Если sha256_client не задан → всегда пишем
-         (обратная совместимость).
-      2) Если артефакт с таким именем отсутствует → пишем.
-      3) Если sha256_client == sha256 существующего → пропускаем.
-      4) Если sha256_client != sha256 существующего → пишем.
     """
     if not sha256_client:
         return False, "no_sha256_provided"
@@ -218,26 +290,13 @@ async def create_or_update(
 
     Если sha256_client задан и совпадает с уже сохранённым файлом
     с таким же именем — файл НЕ перезаписывается.
-
-    Возвращает:
-        {
-          "id": str,
-          "revision": int,
-          "action": "create" | "update",
-          "path": str,
-          "artifacts": [...],
-          "skipped_artifacts": [...],
-          "uploaded_artifacts": [...],
-        }
     """
     rdir = record_dir(
         payload.project, payload.year,
         payload.month, payload.folder_name,
     )
     assert_inside(settings.records_root, rdir)
-    rel_path = str(rdir.relative_to(settings.records_root)).replace(
-        "\\", "/"
-    )
+    rel_path = _relative_path(rdir)
 
     with write_lock():
         # --- определяем, создаём или обновляем ---
@@ -262,8 +321,6 @@ async def create_or_update(
         rdir.mkdir(parents=True, exist_ok=True)
 
         # --- артефакты ---
-        # Копируем существующие артефакты из meta, чтобы не потерять
-        # те, что не пришли в этом запросе.
         artifacts_meta: List[Dict[str, Any]] = list(
             (existing_meta or {}).get("artifacts", []) or []
         )
@@ -272,7 +329,7 @@ async def create_or_update(
         uploaded_artifacts: List[Dict[str, Any]] = []
 
         for kind, filename, content, sha256_raw in files:
-            safe_name = Path(filename).name
+            safe_name = _decode_upload_filename(filename)
             if not safe_name:
                 raise HTTPException(400, "Empty artifact filename")
             dest = rdir / safe_name
@@ -287,8 +344,6 @@ async def create_or_update(
             )
 
             if skip:
-                # Не перезаписываем файл, но обновляем kind на случай,
-                # если он изменился.
                 existing_art = _find_artifact_by_filename(
                     existing_meta or {}, safe_name
                 ) or {}
@@ -371,7 +426,7 @@ async def create_or_update(
             "include_tags_in_prompt": payload.include_tags_in_prompt,
 
             "artifacts": artifacts_meta,
-            "revision": 0,   # проставим ниже
+            "revision": 0,
             "deleted_at": None,
         }
 
@@ -411,6 +466,9 @@ async def create_or_update(
 
         atomic_write_json(rdir / _META, meta)
         atomic_write_json(rdir / _LINKS, links)
+
+        # --- индекс id → path ---
+        records_index.add(record_id, rel_path)
 
         # --- FTS ---
         fts.index_record(
@@ -467,9 +525,7 @@ def patch_record(
 
         meta["updated_at"] = _now_iso()
 
-        rel = str(rdir.relative_to(settings.records_root)).replace(
-            "\\", "/"
-        )
+        rel = _relative_path(rdir)
         rev = append_change(
             entity="record",
             action="update",
@@ -481,7 +537,6 @@ def patch_record(
 
         atomic_write_json(rdir / _META, meta)
 
-        # обновим FTS, если затронули текст
         if {"summary_bb", "name"} & set(changed.keys()):
             fts.index_record(
                 record_id,
@@ -513,11 +568,10 @@ def soft_delete(record_id: str, hard: bool = False) -> Dict[str, Any]:
 
     with write_lock():
         if hard:
-            rel = str(rdir.relative_to(settings.records_root)).replace(
-                "\\", "/"
-            )
+            rel = _relative_path(rdir)
             shutil.rmtree(rdir)
             fts.remove_record(record_id)
+            records_index.remove(record_id)
             rev = append_change(
                 entity="record",
                 action="delete",
@@ -532,9 +586,7 @@ def soft_delete(record_id: str, hard: bool = False) -> Dict[str, Any]:
             return {"id": record_id, "revision": rev, "hard": True}
 
         # soft-delete: маркер + changelog
-        rel = str(rdir.relative_to(settings.records_root)).replace(
-            "\\", "/"
-        )
+        rel = _relative_path(rdir)
         marker = {
             "deleted_at": _now_iso(),
             "id": record_id,
@@ -553,6 +605,9 @@ def soft_delete(record_id: str, hard: bool = False) -> Dict[str, Any]:
         )
         meta["revision"] = rev
         atomic_write_json(rdir / _META, meta)
+
+        # Из индекса не удаляем — soft-delete можно откатить.
+        # find_by_id по-прежнему находит папку.
 
     log.warning(
         "SOFT DELETE: id=%s, path=%s, revision=%d",
@@ -593,9 +648,7 @@ def update_links(
 
         atomic_write_json(rdir / _LINKS, links)
 
-        rel = str(rdir.relative_to(settings.records_root)).replace(
-            "\\", "/"
-        )
+        rel = _relative_path(rdir)
         rev = append_change(
             entity="record",
             action="update_links",
@@ -624,22 +677,12 @@ def upload_single_artifact(
     Если sha256_client задан и совпадает с уже сохранённым файлом
     с таким же именем — файл НЕ перезаписывается, возвращается
     {"skipped": True}.
-
-    Возвращает:
-        {
-          "id": record_id,
-          "filename": str,
-          "size": int,
-          "sha256": str,
-          "skipped": bool,
-          "reason": str,
-        }
     """
     rdir = find_by_id(record_id)
     if not rdir:
         raise HTTPException(404, f"Record not found: {record_id}")
 
-    safe_name = Path(filename).name
+    safe_name = _decode_upload_filename(filename)
     if not safe_name:
         raise HTTPException(400, "Empty artifact filename")
     dest = rdir / safe_name
@@ -690,10 +733,7 @@ def upload_single_artifact(
         meta["artifacts"] = arts
         meta["updated_at"] = _now_iso()
 
-        # ревизия + changelog
-        rel = str(rdir.relative_to(settings.records_root)).replace(
-            "\\", "/"
-        )
+        rel = _relative_path(rdir)
         rev = append_change(
             entity="record",
             action="artifact_upload",
@@ -739,23 +779,16 @@ def check_artifact(
     """
     Проверяет, нужно ли загружать файл, не принимая его содержимое.
 
-    Возвращает:
-        {
-          "id": str,
-          "filename": str,
-          "exists": bool,
-          "skip": bool,        # True — файл уже есть с таким хэшем
-          "reason": str,
-          "sha256": str,       # хэш существующего файла ("" если нет)
-          "size": int,
-          "kind": str,         # kind существующего файла ("" если нет)
-        }
+    ВАЖНО: проверяет не только запись в _meta.json, но и наличие
+    файла на диске (path.is_file()). Если файл пропал (ручное
+    удаление, рассинхрон), HEAD вернёт exists=False — клиент
+    загрузит файл заново.
     """
     rdir = find_by_id(record_id)
     if not rdir:
         raise HTTPException(404, f"Record not found: {record_id}")
 
-    safe_name = Path(filename).name
+    safe_name = _decode_upload_filename(filename)
     if not safe_name:
         raise HTTPException(400, "Empty artifact filename")
 
@@ -769,6 +802,26 @@ def check_artifact(
             "exists": False,
             "skip": False,
             "reason": "artifact_absent",
+            "sha256": "",
+            "size": 0,
+            "kind": "",
+        }
+
+    # --- Проверка фактического файла на диске ---
+    artifact_path = rdir / safe_name
+    if not artifact_path.is_file():
+        log.warning(
+            "check_artifact: запись есть в _meta.json, "
+            "но файл отсутствует на диске: %s "
+            "(record=%s, name=%s)",
+            artifact_path, record_id, safe_name,
+        )
+        return {
+            "id": record_id,
+            "filename": safe_name,
+            "exists": False,
+            "skip": False,
+            "reason": "file_missing_on_disk",
             "sha256": "",
             "size": 0,
             "kind": "",
@@ -805,21 +858,89 @@ def check_artifacts_batch(
     Пакетная проверка: возвращает список результатов,
     по одному на каждый item.
 
-    items: список {"filename": str, "sha256": Optional[str]}
+    Оптимизация: rdir ищется один раз, а не N раз через
+    check_artifact. Это важно — find_by_id хоть и стал O(1)
+    благодаря индексу, но лишние вызовы ни к чему.
     """
-    results = [
-        check_artifact(
-            record_id=record_id,
-            filename=it.get("filename", ""),
-            sha256_client=it.get("sha256"),
-        )
-        for it in items
-    ]
+    if not items:
+        return {"id": record_id, "results": []}
+
+    # Один раз находим rdir.
+    rdir = find_by_id(record_id)
+    if not rdir:
+        raise HTTPException(404, f"Record not found: {record_id}")
+
+    meta = read_meta(rdir) or {}
+
+    results: List[Dict[str, Any]] = []
+    for it in items:
+        raw_name = it.get("filename", "")
+        safe_name = _decode_upload_filename(raw_name)
+        sha = _normalize_sha256(it.get("sha256"))
+
+        if not safe_name:
+            results.append({
+                "filename": raw_name,
+                "sha256": "",
+                "skip": False,
+                "reason": "invalid_filename",
+                "size": 0,
+                "kind": "",
+            })
+            continue
+
+        existing = _find_artifact_by_filename(meta, safe_name)
+
+        if not existing:
+            results.append({
+                "filename": safe_name,
+                "sha256": "",
+                "skip": False,
+                "reason": "artifact_absent",
+                "size": 0,
+                "kind": "",
+            })
+            continue
+
+        # Проверка файла на диске.
+        if not (rdir / safe_name).is_file():
+            log.warning(
+                "check_artifacts_batch: файл отсутствует на диске: "
+                "%s (record=%s)", safe_name, record_id,
+            )
+            results.append({
+                "filename": safe_name,
+                "sha256": "",
+                "skip": False,
+                "reason": "file_missing_on_disk",
+                "size": 0,
+                "kind": "",
+            })
+            continue
+
+        existing_sha = (existing.get("sha256") or "").lower()
+
+        if sha and sha == existing_sha:
+            skip, reason = True, "sha256_match"
+        elif sha:
+            skip, reason = False, "sha256_mismatch"
+        else:
+            skip, reason = False, "no_sha256_provided"
+
+        results.append({
+            "filename": safe_name,
+            "sha256": existing_sha,
+            "skip": skip,
+            "reason": reason,
+            "size": int(existing.get("size", 0)),
+            "kind": existing.get("kind", ""),
+        })
+
+    skipped = sum(1 for r in results if r["skip"])
     log.info(
         "Пакетная проверка артефактов: record=%s, файлов=%d, "
         "пропустить=%d",
-        record_id, len(results),
-        sum(1 for r in results if r["skip"]),
+        record_id, len(results), skipped,
     )
     return {"id": record_id, "results": results}
 

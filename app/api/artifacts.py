@@ -6,9 +6,16 @@
     загружать файл (без передачи содержимого).
   • POST /records/{id}/artifacts/check — пакетная проверка списка
     файлов перед загрузкой.
+
+Изменения:
+  • _safe_artifact_path заменён на assert_inside из paths.py —
+    единая защита от path traversal.
+  • upload_artifact читает тело чанками с проверкой лимита
+    (max_artifact_bytes), не накапливая весь файл в память.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -21,9 +28,11 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from .. import records_service
 from ..atomic import atomic_write_json, read_json
 from ..auth import require_api_key
+from ..config import settings
 from ..locks import write_lock
 from ..logger import get_logger
 from ..models import ArtifactCheckRequest, ArtifactCheckResponse
+from ..paths import assert_inside
 
 router = APIRouter(
     prefix="/records",
@@ -33,14 +42,66 @@ router = APIRouter(
 log = get_logger(__name__)
 
 
+# Размер чанка при чтении загружаемого файла.
+_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 МБ
+
+
 def _safe_artifact_path(rdir: Path, filename: str) -> Path:
-    """Защита от path traversal в имени артефакта."""
-    if "/" in filename or "\\" in filename or filename in (".", ".."):
+    """
+    Возвращает безопасный путь к артефакту внутри rdir.
+
+    Защита от path traversal:
+      • имя файла не должно содержать '/' или '\\';
+      • имя не должно быть '.' или '..';
+      • итоговый путь проверяется через assert_inside (единая
+        защита с records_service).
+
+    filename приходит из path-параметра FastAPI — уже
+    URL-декодированный.
+    """
+    if not filename:
+        raise HTTPException(400, "Empty filename")
+    if "/" in filename or "\\" in filename:
         raise HTTPException(400, "Invalid filename")
-    target = (rdir / filename).resolve()
-    if not str(target).startswith(str(rdir.resolve())):
-        raise HTTPException(400, "Path traversal detected")
+    if filename in (".", ".."):
+        raise HTTPException(400, "Invalid filename")
+
+    target = rdir / filename
+    assert_inside(rdir, target)
     return target
+
+
+async def _read_upload_file_with_limit(
+    file: UploadFile,
+    max_bytes: int,
+) -> bytes:
+    """
+    Читает UploadFile чанками с проверкой лимита.
+
+    Если файл превышает max_bytes — бросает 413, не накапливая
+    весь файл в память (в отличие от await file.read()).
+
+    Возвращает содержимое (bytes). Гарантированно ≤ max_bytes.
+    """
+    chunks: List[bytes] = []
+    total = 0
+
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"Artifact '{file.filename or 'file'}' too large: "
+                    f"{total} > {max_bytes}"
+                ),
+            )
+        chunks.append(chunk)
+
+    return b"".join(chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -98,9 +159,6 @@ async def head_artifact(
     """
     Проверяет, нужно ли загружать файл, БЕЗ передачи содержимого.
 
-    Заголовки запроса:
-      • X-Content-SHA256 — опциональный хэш клиента.
-
     Заголовки ответа:
       • X-Artifact-Skip       — "true" | "false"
       • X-Artifact-SHA256     — хэш существующего файла или ""
@@ -119,8 +177,6 @@ async def head_artifact(
         )
     except HTTPException as exc:
         if exc.status_code == 404:
-            # записи нет — отдадим 404, клиент поймёт, что грузить
-            # некуда (но это не «файла нет»). Логируем отдельно.
             log.info(
                 "HEAD артефакта: запись не найдена, id=%s", record_id
             )
@@ -134,7 +190,6 @@ async def head_artifact(
     }
 
     if not result["exists"]:
-        # 404 без тела — HEAD-семантика
         return Response(status_code=404, headers=headers)
 
     log.debug(
@@ -192,8 +247,13 @@ async def upload_artifact(
     Если sha256 передан и совпадает с уже сохранённым файлом
     с таким же именем — файл НЕ перезаписывается, возвращается
     {"skipped": true}.
+
+    Файл читается чанками с проверкой лимита max_artifact_bytes —
+    не накапливается в память целиком.
     """
-    content = await file.read()
+    content = await _read_upload_file_with_limit(
+        file, settings.max_artifact_bytes
+    )
     filename = Path(file.filename or "file").name
 
     sha_clean: Optional[str] = None

@@ -1,4 +1,9 @@
-"""CRUD записей."""
+"""CRUD записей.
+
+Изменения:
+  • Загрузка файлов — чанками с проверкой лимита
+    max_artifact_bytes (не накапливаем гигантский файл в память).
+"""
 from __future__ import annotations
 
 import json
@@ -6,6 +11,7 @@ from typing import List, Optional
 
 from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Query, UploadFile,
+    status,
 )
 
 from .. import fts, records_service
@@ -22,6 +28,41 @@ router = APIRouter(
     dependencies=[Depends(require_api_key)],
 )
 log = get_logger(__name__)
+
+
+# Размер чанка при чтении загружаемого файла.
+_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 МБ
+
+
+async def _read_upload_chunked(
+    f: UploadFile,
+    max_bytes: int,
+) -> bytes:
+    """
+    Читает UploadFile чанками с проверкой лимита.
+
+    Если файл превышает max_bytes — бросает 413, не накапливая
+    весь файл в память.
+    """
+    chunks: List[bytes] = []
+    total = 0
+
+    while True:
+        chunk = await f.read(_UPLOAD_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"Artifact '{f.filename or 'file'}' too large: "
+                    f"{total} > {max_bytes}"
+                ),
+            )
+        chunks.append(chunk)
+
+    return b"".join(chunks)
 
 
 @router.post("", response_model=RecordResponse)
@@ -73,13 +114,11 @@ async def create_or_update_record(
 
     parsed_files: List[tuple] = []
     for i, f in enumerate(files):
-        content = await f.read()
-        if len(content) > settings.max_artifact_bytes:
-            raise HTTPException(
-                413,
-                f"Artifact '{f.filename}' too large: "
-                f"{len(content)} > {settings.max_artifact_bytes}",
-            )
+        # Читаем чанками с проверкой лимита — не накапливаем
+        # весь файл в память до проверки.
+        content = await _read_upload_chunked(
+            f, settings.max_artifact_bytes
+        )
         kind = kinds[i] if i < len(kinds) else "attachment"
         sha_i = sha256[i].strip() if i < len(sha256) else None
         if sha_i == "":
