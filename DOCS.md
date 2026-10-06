@@ -1,6 +1,6 @@
 # Техническая документация API сервиса `screc-server`
 
-**Версия:** 1.1.0
+**Версия:** 1.2.0
 **Назначение:** синхронизация записей (протоколов, стенограмм, summary) между клиентами одного пользователя через HTTP API. Хранение — файловая система, без БД.
 
 ---
@@ -35,6 +35,7 @@
 - Даёт полнотекстовый поиск (инвертированный индекс в JSON).
 - **Проверяет SHA-256 артефактов** — можно не перезаписывать файл, если он уже сохранён (см. §7).
 - **Поддерживает условную загрузку** — клиент может спросить, нужно ли вообще отправлять файл.
+- **Отдаёт публичную HTML-страницу записи** (без авторизации) — удобно для шаринга ссылки на запись коллеге (см. §6.7).
 
 ### 1.2. Чего сервис **не** делает
 
@@ -47,6 +48,8 @@
 - **Не имеет эндпоинта массового удаления артефактов** (`DELETE /records/{id}/artifacts`). Удалять артефакты нужно по одному.
 - **Не пишет удаление артефактов в `changelog`.** `revision` не растёт при удалении артефакта, клиент B не узнает об удалении через `/sync/changes`.
 - **Не имеет эндпоинта перемещения записи** (`move`) между проектами/годами/месяцами.
+- **Не рендерит `.docx`/`.pdf` протоколы как текст** на публичной странице — только отдаёт файл на скачивание (см. §6.7).
+- **Не рендерит Markdown** в `summary_bb` — выводит как plain text.
 
 ### 1.3. Технологии
 
@@ -59,6 +62,7 @@
 | Хранилище | файловая система |
 | Логи | logging + RotatingFileHandler |
 | Хэши | SHA-256 |
+| HTML-рендер | f-strings + `html.escape` (без шаблонизатора) |
 
 ---
 
@@ -101,6 +105,16 @@ curl -s -H "X-API-Key: $API_KEY" \
 
 Ожидаемо: `[]` (пустой список проектов).
 
+### 2.4. Публичный просмотр записи (без ключа)
+
+```bash
+RECORD_ID="<id из ответа POST /records>"
+
+open "http://localhost:8000/view/vNext/2026/09/rec?id=$RECORD_ID"
+```
+
+Подробнее — §6.7.
+
 ---
 
 ## 3. Аутентификация
@@ -121,6 +135,7 @@ X-API-Key: <ключ>
 |---|---|
 | `GET /health` | ❌ |
 | `GET /docs`, `/openapi.json`, `/redoc` | ❌ (если включено) |
+| `GET /view/**` | ❌ (публичный просмотр, см. §6.7) |
 | Все `/api/v1/**` | ✅ |
 
 ### 3.3. Ответы при ошибке
@@ -200,7 +215,7 @@ X-API-Key: <ключ>
 
 | Поле | Тип | Описание |
 |---|---|---|
-| `kind` | string | `transcript` / `summary` / `protocol` / `manual_protocol` / `deepseek_prompt` / `attachment` |
+| `kind` | string | `transcript` / `summary` / `protocol` / `manual_protocol` / `deepseek_prompt` / `audio` / `video` / `attachment` |
 | `filename` | string | Оригинальное имя файла |
 | `size` | int | Размер в байтах |
 | `sha256` | string | SHA-256 содержимого (считается сервером) |
@@ -359,11 +374,20 @@ X-API-Key: <ключ>
     "duration": 3600.5,
     "updated_at": "2026-09-08T08:35:00+00:00"
   },
+  "audio": {
+    "url": "file:///home/user/recs/audio.mp3",
+    "size": 12345678,
+    "mime": "audio/mpeg",
+    "duration": 3600.5,
+    "updated_at": "2026-09-08T08:35:00+00:00"
+  },
   "updated_at": "2026-09-08T08:35:00+00:00"
 }
 ```
 
-Если видео нет — `"video": null`.
+Если видео/аудио нет — `"video": null` / `"audio": null`.
+
+> **Примечание.** Запись `audio` через API сейчас **не поддерживается**: `PUT /records/{id}/video-url` пишет только `video`. Поле `audio` появилось в модели для поддержки публичного просмотра (§6.7), но чтобы его заполнить, нужно либо расширить `update_links`, либо положить артефакт с `kind="audio"`.
 
 ### 5.5. Формат `changelog.jsonl`
 
@@ -562,7 +586,7 @@ X-API-Key: <ключ>
 }
 ```
 
-Soft-delete: запись исключается из `/tree`, но остаётся на диске. Событие `delete` пишется в `changelog`.
+Soft-delete: запись исключается из `/tree` и из публичного просмотра `/view/**`, но остаётся на диске. Событие `delete` пишется в `changelog`.
 
 > **Примечание.** Повторный soft-delete **не идемпотентен**: каждый вызов создаёт новую ревизию и перезаписывает `_deleted.json` / `_meta.json`. Проверки `is_deleted()` перед удалением в коде нет.
 
@@ -604,6 +628,8 @@ Soft-delete: запись исключается из `/tree`, но остаёт
 Все поля опциональные. Пустые не перезаписываются.
 
 **Ответ 200:** `{"id": "...", "revision": 104, "video": {...}}`.
+
+> **Примечание.** Через этот эндпоинт можно задать только `video`. Ссылка на аудио (`audio` в `_links.json`) устанавливается только через артефакт `kind="audio"` — отдельного эндпоинта нет.
 
 ---
 
@@ -936,6 +962,134 @@ X-Artifact-Kind: transcript
 Используется при **первой** синхронизации (когда `last_synced_revision = 0` и `changes` не подходит).
 
 > **Примечание.** `snapshot` читает **все** `_meta.json` и `_links.json` из дерева. При 10 000 записей это тяжёлый запрос. Рекомендуется выполнять его редко (при первой синхронизации) и не использовать как периодический.
+
+---
+
+### 6.7. Публичный просмотр
+
+Префикс: `/view`. **Авторизация не требуется.**
+
+#### `GET /view/{project}/{year}/{month}/{folder_name}` — HTML-страница записи
+
+Отдаёт полноценную HTML-страницу с информацией о записи.
+Полезно, чтобы отправить ссылку коллеге или встроить в iframe.
+
+**Query-параметры:**
+
+| Имя | Тип | Обяз. | Описание |
+|---|---|---|---|
+| `id` | string | ✅ | `id` из `_meta.json`. Должен совпадать — иначе 404. |
+| `blocks` | string | ❌ | Список блоков через запятую. По умолчанию `all`. |
+
+**Значения `blocks`:**
+
+| Блок | Что показывает |
+|---|---|
+| `video` | HTML5 `<video>` плеер. Источник — `_links.json → video.url`. |
+| `audio` | HTML5 `<audio>` плеер. Источник — артефакт `kind=audio` или `_links.json → audio.url`. |
+| `transcript` | Ссылки на файлы стенограммы. Открываются в новой вкладке. |
+| `protocol` | Текст протокола + кнопка «Скачать». |
+| `summary` | Текст `summary_bb` из `_meta.json`. |
+| `all` | Все блоки (значение по умолчанию). |
+
+Заголовок с именем, датой, тегами, описанием и комментарием
+показывается **всегда**.
+
+**Ответ 200:** `text/html; charset=utf-8`.
+
+**Ответы об ошибках:**
+
+| HTTP | Когда |
+|---|---|
+| 400 | Недопустимое имя сегмента пути |
+| 404 | Папка не найдена / `_meta.json` отсутствует / `id` не совпал / запись soft-deleted |
+| 500 | Повреждённый `_meta.json` |
+
+**Пример:**
+
+```bash
+curl -s \
+  "http://localhost:8000/view/vNext/2026/09/2026-09-08%20формирование?id=770e8400-..." \
+  | head -40
+```
+
+**Только summary и стенограмма:**
+
+```
+http://localhost:8000/view/vNext/2026/09/2026-09-08%20формирование
+    ?id=770e8400-...
+    &blocks=summary,transcript
+```
+
+**Встроить в iframe:**
+
+```html
+<iframe
+  src="http://localhost:8000/view/vNext/2026/09/rec?id=770e...&blocks=summary"
+  width="100%" height="500"
+  style="border:1px solid #ddd;border-radius:8px">
+</iframe>
+```
+
+> **Безопасность.** Эндпоинт **публичный**. Если сервис доступен
+> из интернета — обязательно HTTPS и, желательно, reverse-proxy
+> с rate limiting. Ссылка содержит `id`, который является
+> секретом: кто знает `id` и путь — получит доступ.
+
+---
+
+#### `GET /view/{project}/{year}/{month}/{folder_name}/artifact/{filename}` — публичная отдача артефакта
+
+Отдаёт файл артефакта записи без авторизации. Используется
+ссылками внутри HTML-страницы (стенограмма, протокол).
+
+**Query-параметры:**
+
+| Имя | Тип | Обяз. | Описание |
+|---|---|---|---|
+| `id` | string | ✅ | `id` из `_meta.json`. |
+| `download` | bool | ❌ | `true` → `Content-Disposition: attachment`. По умолчанию `false` (inline). |
+
+**Ответ 200:** бинарный контент.
+
+**Ответы об ошибках:**
+
+| HTTP | Когда |
+|---|---|
+| 400 | Недопустимое имя файла (`/`, `\`, `.`, `..`) |
+| 404 | Запись не найдена / `id` не совпал / файла нет в `_meta.json` / файла нет на диске |
+
+**Защита:**
+
+- `filename` должен быть **в списке артефактов** `_meta.json`.
+  Нельзя запросить произвольный файл из папки записи.
+- Путь проверяется через `assert_inside` (path traversal).
+- Проверка `id` — как в HTML-странице.
+
+**Пример:**
+
+```bash
+# Открыть в браузере (inline)
+curl -OJ "http://localhost:8000/view/vNext/2026/09/rec/artifact/ПРОТОКОЛ.docx?id=770e..."
+
+# Скачать (attachment)
+curl -OJ "http://localhost:8000/view/vNext/2026/09/rec/artifact/ПРОТОКОЛ.docx?id=770e...&download=true"
+```
+
+---
+
+#### Ограничения публичного просмотра
+
+- **`.docx` и `.pdf`** не рендерятся как текст (это бинарные
+  форматы) — показывается только кнопка «Скачать».
+  Текстовые (`.md`, `.txt`) — рендерятся.
+- **Markdown в `summary_bb`** не рендерится, выводится как
+  `<pre>` с исходным текстом.
+- **Видео/аудио** воспроизводятся браузером только если ссылка
+  доступна по HTTP(S). `file:///...` браузер не откроет — будет
+  показана «немая» дорожка с ошибкой.
+- **Rate limiting** отсутствует. При публикации наружу —
+  ставить за reverse-proxy.
 
 ---
 
@@ -1287,6 +1441,57 @@ for art in artifacts:
     )
 ```
 
+### 8.9. Поделиться ссылкой на запись (публичный просмотр)
+
+**Задача:** отправить коллеге ссылку, чтобы он открыл запись в браузере.
+
+```python
+def share_link(base_url, record):
+    """
+    record — ответ GET /api/v1/records/{id} (RecordFull).
+    """
+    path = record["path"]              # "vNext/2026/09/2026-09-30 тест"
+    project, year, month, folder_name = path.split("/", 3)
+    return (
+        f"{base_url}/view/"
+        f"{quote(project)}/{quote(year)}/{quote(month)}/{quote(folder_name)}"
+        f"?id={quote(record['id'])}"
+    )
+
+# Полный просмотр
+print(share_link("http://server:8000", rec))
+
+# Только summary + протокол
+print(share_link("http://server:8000", rec) + "&blocks=summary,protocol")
+```
+
+**Встроить в HTML-страницу:**
+
+```html
+<iframe
+  src="http://server:8000/view/vNext/2026/09/2026-09-30%20тест?id=770e...&blocks=summary"
+  width="100%" height="500"
+  style="border:1px solid #ddd;border-radius:8px">
+</iframe>
+```
+
+### 8.10. Отдать ссылку на артефакт для скачивания
+
+```python
+def artifact_download_link(base_url, record, filename):
+    path = record["path"]
+    project, year, month, folder_name = path.split("/", 3)
+    return (
+        f"{base_url}/view/"
+        f"{quote(project)}/{quote(year)}/{quote(month)}/{quote(folder_name)}"
+        f"/artifact/{quote(filename)}"
+        f"?id={quote(record['id'])}&download=true"
+    )
+```
+
+**Важно:** так можно расшарить только файлы, которые уже есть
+в `_meta.json`. Произвольные файлы из папки записи недоступны.
+
 ---
 
 ## 9. Ошибки
@@ -1306,7 +1511,7 @@ for art in artifacts:
 | 200 | OK | Успех |
 | 400 | Bad Request | Некорректный payload, `kinds`/`sha256` не совпадает, path traversal |
 | 401 | Unauthorized | Нет или неверный `X-API-Key` |
-| 404 | Not Found | Запись/проект/файл не найдены |
+| 404 | Not Found | Запись/проект/файл не найдены, `id` в `/view` не совпал |
 | 413 | Payload Too Large | Файл или payload превышает лимит |
 | 422 | Unprocessable Entity | Ошибки валидации Pydantic |
 | 500 | Internal Server Error | Ошибка сервера (смотрите `logs/screc.error.log`) |
@@ -1337,6 +1542,15 @@ for art in artifacts:
 {"detail": "sha256 length (1) != files length (2)"}
 ```
 
+**`id` в `/view/...` не совпадает с `_meta.json`:**
+
+```json
+{"detail": "Record not found"}
+```
+
+(Сервер **намеренно** отдаёт 404 вместо 403, чтобы не подтверждать
+существование записи по угаданному пути.)
+
 ---
 
 ## 10. Ограничения и лимиты
@@ -1354,6 +1568,7 @@ for art in artifacts:
 | Макс. артефактов на запись | — | 500 (в `check`) |
 | Индексируемый размер артефакта | — | 2 МБ |
 | Макс. результатов поиска | — | 500 |
+| Макс. размер текста протокола на `/view` | — | 2 МБ |
 
 ### 10.1. Санитизация имён
 
@@ -1366,6 +1581,8 @@ for art in artifacts:
 
 Имена артефактов — только базовое имя (`Path(filename).name`). Путь проверяется через `assert_inside`.
 
+Та же санитизация применяется в публичном просмотре `/view/**`.
+
 ### 10.2. Формат хэша
 
 - SHA-256, hex-нижний регистр.
@@ -1376,8 +1593,9 @@ for art in artifacts:
 ### 10.3. Прочие лимиты, о которых стоит помнить
 
 - **Нет лимита на количество артефактов в записи** при загрузке через `POST /records` (лимит 500 применяется только к `POST /records/{id}/artifacts/check`). На практике запись может накопить сколько угодно артефактов.
-- **Нет rate limiting.** Рекомендуется ставить за reverse-proxy.
+- **Нет rate limiting.** Рекомендуется ставить за reverse-proxy. Особенно актуально для публичного `/view/**`.
 - **`upload_artifact` читает файл целиком в память** (`await file.read()`) перед проверкой размера. Для файлов близко к лимиту это может быть заметно по RAM.
+- **Публичный `/view/**` не имеет отдельного лимита запросов.** Один клиент может «долбить» страницу и создавать нагрузку на диск (чтение `_meta.json`, `_links.json`, файлов протокола).
 
 ---
 
@@ -1643,6 +1861,50 @@ class ScrecClient:
         r.raise_for_status()
         return r.json()
 
+    # --- Публичный просмотр ---
+    def view_url(
+        self,
+        record: dict,
+        blocks: Optional[list[str]] = None,
+    ) -> str:
+        """
+        Возвращает публичную ссылку на HTML-страницу записи.
+
+        record — ответ GET /api/v1/records/{id} (RecordFull).
+        blocks — список блоков, например ["summary", "protocol"].
+                 None → all.
+        """
+        path = record["path"]
+        project, year, month, folder_name = path.split("/", 3)
+        url = (
+            f"{self.base_url}/view/"
+            f"{quote(project)}/{quote(year)}/{quote(month)}/"
+            f"{quote(folder_name)}?id={quote(record['id'])}"
+        )
+        if blocks:
+            url += "&blocks=" + ",".join(blocks)
+        return url
+
+    def view_artifact_url(
+        self,
+        record: dict,
+        filename: str,
+        *,
+        download: bool = False,
+    ) -> str:
+        """Публичная ссылка на скачивание артефакта записи."""
+        path = record["path"]
+        project, year, month, folder_name = path.split("/", 3)
+        url = (
+            f"{self.base_url}/view/"
+            f"{quote(project)}/{quote(year)}/{quote(month)}/"
+            f"{quote(folder_name)}/artifact/{quote(filename)}"
+            f"?id={quote(record['id'])}"
+        )
+        if download:
+            url += "&download=true"
+        return url
+
     def close(self) -> None:
         self.client.close()
 
@@ -1684,6 +1946,12 @@ with ScrecClient("http://localhost:8000", "my-key") as c:
         path=Path("/tmp/attachment.pdf"),
     )
     print(info)
+
+    # Публичная ссылка на просмотр
+    rec = c.get_record(result["id"])
+    print("Просмотр:", c.view_url(rec, blocks=["summary", "protocol"]))
+    print("Скачать протокол:",
+          c.view_artifact_url(rec, "protocol.docx", download=True))
 ```
 
 ---
@@ -1727,6 +1995,7 @@ with ScrecClient("http://localhost:8000", "my-key") as c:
 
 ```
 2026-09-30 12:05:00.756 [ACCESS] 172.18.0.1 POST /api/v1/records → 200 (45.2 ms) [a1b2c3d4]
+2026-09-30 12:05:10.123 [ACCESS] 172.18.0.1 GET /view/vNext/2026/09/rec → 200 (3.5 ms) [i9j0k1l2]
 ```
 
 **Записи про хэши:**
@@ -1735,6 +2004,14 @@ with ScrecClient("http://localhost:8000", "my-key") as c:
 screc.app.records_service: Артефакт пропущен (sha256 совпал): record=..., kind=transcript, name=transcript.md, sha=abc123...
 screc.app.records_service: Артефакт сохранён: record=..., kind=transcript, name=transcript.md, size=12345, reason=artifact_absent, sha=def456...
 screc.app.api.artifacts: HEAD артефакта: record=..., name=transcript.md, exists=True, skip=True, reason=sha256_match
+```
+
+**Записи про публичный просмотр:**
+
+```
+screc.app.api.view: view: path=vNext/2026/09/rec, id=770e..., blocks=summary,transcript
+screc.app.api.view: view/artifact: record=770e..., file=protocol.docx, size=4567, download=True
+screc.app.api.view: view: id mismatch (url='...', meta='...', path=...)
 ```
 
 ### 12.3. Проверка состояния
@@ -1783,12 +2060,17 @@ docker compose restart
 - **`GET /api/v1/health`** (с `records_count`) делает `rglob` по дереву. Не вызывайте его часто; используйте `GET /health` (без авторизации) — он дешёвый.
 - **FTS** читает `fts.json` целиком при каждом поиске. При индексе в десятки МБ это заметно.
 - **`/sync/snapshot`** читает все `_meta.json` и `_links.json`. Используйте только при первой синхронизации.
+- **`/view/**`** читает `_meta.json`, `_links.json` и файлы протоколов при каждом заходе. Протокол читается целиком (до 2 МБ) и рендерится в HTML. При частом открытии больших протоколов — заметно.
 
 ### 12.7. Безопасность
 
 - **API-ключ** сравнивается через `hmac.compare_digest` — защита от timing-атак.
-- **Path traversal** закрыт на двух уровнях (`_safe_segment` + `assert_inside`).
-- **Rate limiting не реализован.** Рекомендуется ставить сервис за reverse-proxy с ограничением скорости.
+- **Path traversal** закрыт на двух уровнях (`_safe_segment` + `assert_inside`). То же применяется к `/view/**`.
+- **Публичный `/view/**`** доступен без ключа. Защита — только совпадение `id` из URL с `_meta.json`. Если сервис доступен из интернета:
+  - обязательно HTTPS;
+  - reverse-proxy с rate limiting (`nginx limit_req` / `traefik rate-limit`) — защита от перебора `id`;
+  - желательно ограничить доступ по IP/сети на уровне прокси.
+- **Rate limiting не реализован** (см. выше).
 - **MIME-валидации нет.** `FileResponse` отдаёт файл с `Content-Disposition: inline` и без `X-Content-Type-Options: nosniff`. Если сервис доступен в браузере, злоумышленник может загрузить `.html` и добиться stored XSS. Решения:
   - отдавать все артефакты с `?inline=false` (`Content-Disposition: attachment`);
   - либо настроить reverse-proxy с `X-Content-Type-Options: nosniff` и строгим CSP.
@@ -1800,6 +2082,7 @@ docker compose restart
 
 ### 13.1. Текущая версия
 
+`1.2.0` — добавлен публичный HTML-просмотр записи.
 `1.1.0` — добавлена проверка хэшей и условная загрузка.
 `1.0.0` — базовая версия API.
 
@@ -1819,7 +2102,18 @@ docker compose restart
 | `HEAD /records/{id}/artifacts/{filename}` | Новый эндпоинт |
 | `POST /records/{id}/artifacts/check` | Новый эндпоинт |
 
-### 13.4. Что делать клиенту при обновлении сервера
+### 13.4. Что нового в 1.2.0
+
+| Изменение | Совместимость |
+|---|---|
+| `GET /view/{project}/{year}/{month}/{folder_name}` — публичная HTML-страница | Новый публичный роутер, без авторизации |
+| `GET /view/{project}/{year}/{month}/{folder_name}/artifact/{filename}` — публичная отдача артефакта | Новый публичный роутер |
+| Параметр `blocks` для выбора отображаемых блоков | Новый параметр |
+| Параметр `download` для скачивания артефактов на странице | Новый параметр |
+| Кнопка «Скачать» для протоколов | UI |
+| Возможность задать `audio` в `_links.json` через артефакт `kind=audio` | Расширение |
+
+### 13.5. Что делать клиенту при обновлении сервера
 
 - Читать `record.revision` — он всегда растёт.
 - Не полагаться на порядок полей в JSON.
@@ -1827,12 +2121,15 @@ docker compose restart
 - Использовать `since_revision` для дельты, а `snapshot` — только при `last_synced_revision == 0`.
 - Не полагаться на события артефактов в `changelog` — их там нет.
 - Периодически перезагружать запись целиком, чтобы увидеть удаления артефактов.
+- При использовании публичного просмотра — не забывать передавать `id`
+  (это обязательный параметр, без него 404).
 
-### 13.5. Обратная совместимость хранилища
+### 13.6. Обратная совместимость хранилища
 
 - Новые поля в `_meta.json` добавляются, старые не удаляются.
 - Формат `changelog.jsonl` append-only; старые события не переписываются.
 - При изменении формата `_meta.json` сервис мигрирует на чтении.
+- Публичный просмотр `/view/**` — read-only, ничего не меняет в хранилище.
 
 ---
 
@@ -1853,6 +2150,9 @@ docker compose restart
 | Rate limiting | — | **Нет** |
 | MIME-валидация артефактов | — | **Нет** |
 | `X-Content-Type-Options: nosniff` | — | **Нет** |
+| Эндпоинт управления `audio` (по аналогии с `video-url`) | §5.4 | **Нет**; только артефакт `kind=audio` |
+| Markdown-рендер `summary_bb` на публичной странице | §6.7 | **Нет**; выводится как `<pre>` |
+| Рендер `.docx`/`.pdf` протоколов на публичной странице | §6.7 | **Нет**; только скачивание |
 
 ### 14.2. Работает, но с оговорками
 
@@ -1865,6 +2165,8 @@ docker compose restart
 | `POST /records/{id}/artifacts/check` | Для N items делает N обходов дерева (`find_by_id`) |
 | `upload_artifact` | Читает файл в память целиком перед проверкой размера |
 | `main.py` | Использует deprecated `@app.on_event("startup"/"shutdown")` вместо `lifespan` |
+| Публичный `/view/**` | Не имеет rate limiting; протокол читается целиком (до 2 МБ) на каждый заход |
+| `_links.json → audio` | Поле есть, но эндпоинта для его заполнения нет — только артефакт `kind=audio` |
 
 ### 14.3. Что стоит доработать в первую очередь
 
@@ -1875,6 +2177,9 @@ docker compose restart
 5. **`server_revision = get_revision()`** в `/sync/changes` — вместо максимума по выданным.
 6. **Идемпотентность `soft_delete`** — проверка `is_deleted()` перед удалением.
 7. **MIME-валидация и `nosniff`** — безопасность при работе через браузер.
+8. **Markdown-рендер `summary_bb`** на публичной странице — сейчас выводится как plain text.
+9. **Рендер `.docx`/`.pdf` протоколов** — сейчас только скачивание.
+10. **Rate limiting** для `/view/**` — если сервис публикуется наружу.
 
 ---
 
@@ -1908,6 +2213,8 @@ docker compose restart
 | GET | `/api/v1/records/_/search` | ✅ | Поиск |
 | GET | `/api/v1/sync/changes` | ✅ | Дельта изменений |
 | GET | `/api/v1/sync/snapshot` | ✅ | Полный снапшот |
+| GET | `/view/{project}/{year}/{month}/{folder_name}` | ❌ | Публичная HTML-страница записи |
+| GET | `/view/{project}/{year}/{month}/{folder_name}/artifact/{filename}` | ❌ | Публичная отдача артефакта записи |
 
 ---
 
@@ -1946,4 +2253,18 @@ docker compose restart
 - [ ] **Учитывать, что удаление артефактов не пишется в `changelog`.** Для multi-client синхронизации удалений — периодически перезагружать запись целиком и сравнивать список артефактов с локальным.
 - [ ] **Учитывать, что эндпоинта массового удаления (`DELETE /records/{id}/artifacts`) нет.** Удалять по одному.
 - [ ] **Учитывать, что soft-delete артефактов не реализован.** Все удаления — физические.
-```
+
+### Публичный просмотр (опционально)
+
+- [ ] Понять, кому и как будут передаваться ссылки на просмотр.
+- [ ] Убедиться, что сервис за HTTPS (если публикуется наружу).
+- [ ] Настроить rate limiting на reverse-proxy для `/view/**`.
+- [ ] Проверить, что `_links.json → video.url` доступен браузеру
+      (HTTP(S), а не `file://`).
+- [ ] Убедиться, что протоколы в текстовом формате (`.md`, `.txt`),
+      если нужен рендер на странице. `.docx` будет только
+      скачиваться.
+- [ ] При использовании iframe — проверить, что CSP родительской
+      страницы разрешает встраивание.
+- [ ] Проверить, что `id` в ссылке не попадает в публичные логи
+      (access-log его не пишет, но reverse-proxy может).

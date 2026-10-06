@@ -14,6 +14,7 @@ summary, вложения), хранит их в виде дерева
 - Один пользователь, один API-ключ.
 - Полнотекстовый поиск (инвертированный индекс в JSON).
 - Дельта-синхронизация через `revision` + `changelog.jsonl`.
+- **Публичный HTML-просмотр записи** (без авторизации) — см. §14.
 - Логи с ротацией.
 - Готов к запуску в Docker за минуту.
 
@@ -34,7 +35,8 @@ summary, вложения), хранит их в виде дерева
 11. [Бэкап и восстановление](#11-бэкап-и-восстановление)
 12. [Устранение неполадок](#12-устранение-неполадок)
 13. [API](#13-api)
-14. [Лицензия](#14-лицензия)
+14. [Публичный просмотр записи](#14-публичный-просмотр-записи)
+15. [Лицензия](#15-лицензия)
 
 ---
 
@@ -376,6 +378,20 @@ tail -f logs/access/access.log
 
 Откройте <http://localhost:8000/docs>. Все эндпоинты с примерами. Для авторизации нажмите **Authorize** и введите ключ.
 
+### 6.8. Публичный просмотр записи
+
+```bash
+RECORD_ID="770e8400-..."   # id из ответа §6.3
+
+# Всё, что есть
+curl -s "http://localhost:8000/view/vNext/2026/09/2026-09-29%20тестовая%20запись?id=$RECORD_ID" | head -40
+
+# Только summary и стенограмма
+open "http://localhost:8000/view/vNext/2026/09/2026-09-29%20тестовая%20запись?id=$RECORD_ID&blocks=summary,transcript"
+```
+
+Подробнее — в §14.
+
 ---
 
 ## 7. Локальная отладка без Docker
@@ -501,6 +517,7 @@ data/
 ```
 2026-09-29 12:05:00.756 [ACCESS] 172.18.0.1 POST /api/v1/records → 200 (45.2 ms) [a1b2c3d4]
 2026-09-29 12:05:05.789 [ACCESS] 172.18.0.1 GET /api/v1/tree → 200 (2.1 ms) [e5f6g7h8]
+2026-09-29 12:05:10.123 [ACCESS] 172.18.0.1 GET /view/vNext/2026/09/rec → 200 (3.5 ms) [i9j0k1l2]
 ```
 
 ### 9.3. Просмотр
@@ -722,11 +739,41 @@ ports:
 
 Сервис будет доступен на `http://localhost:8080`.
 
+### 12.9. Страница `/view/...` отдаёт 404 при верном пути
+
+Проверьте:
+
+1. **`id` в URL совпадает с `_meta.json`.** Если `id` неверный —
+   сервер намеренно отдаёт 404 (защита от перебора путей):
+   ```bash
+   jq '.id' "data/records/vNext/2026/09/rec/_meta.json"
+   ```
+2. **Запись не soft-deleted.** Наличие `_deleted.json` в папке
+   записи тоже даёт 404:
+   ```bash
+   ls "data/records/vNext/2026/09/rec/_deleted.json"
+   ```
+3. **Путь в URL точно совпадает с путём на диске** (с учётом
+   `_safe_segment` — пробелы, точки и запрещённые символы
+   нормализуются). Проще всего взять путь из ответа `POST /records`
+   или `GET /records/{id}` → поле `path`.
+
+### 12.10. Видео/аудио на странице `/view/...` не играет
+
+Скорее всего, в `_links.json` лежит `file:///...`. Браузер не
+может открыть локальный файл по такой ссылке. Варианты:
+
+- положить видео на HTTP(S)-хостинг и обновить ссылку через
+  `PUT /api/v1/records/{id}/video-url`;
+- либо отдавать видео как артефакт `kind=video` (тогда оно
+  поедет через `/view/.../artifact/...`, но это против
+  архитектуры сервиса — видео не хранится на сервере).
+
 ---
 
 ## 13. API
 
-Полная документация API — в файле [`API.md`](./API.md) (или в Swagger на `/docs`).
+Полная документация API — в файле [`DOCS.md`](./DOCS.md) (или в Swagger на `/docs`).
 
 ### 13.1. Краткая шпаргалка
 
@@ -760,6 +807,12 @@ curl -s -H "X-API-Key: $API_KEY" \
 # Поиск
 curl -s -H "X-API-Key: $API_KEY" \
   "$BASE/api/v1/records/_/search?q=реестр" | jq
+
+# Публичный просмотр записи (без ключа)
+open "$BASE/view/vNext/2026/09/2026-09-29%20тестовая%20запись?id=<record_id>"
+
+# Только summary и стенограмма
+open "$BASE/view/vNext/2026/09/2026-09-29%20тестовая%20запись?id=<record_id>&blocks=summary,transcript"
 ```
 
 ### 13.2. OpenAPI
@@ -774,7 +827,125 @@ http://localhost:8000/openapi.json
 
 ---
 
-## 14. Лицензия
+## 14. Публичный просмотр записи
+
+Эндпоинт **без авторизации** — отдаёт HTML-страницу с информацией
+о записи. Полезно, чтобы отправить ссылку коллеге или встроить
+страницу в iframe/внутренний портал.
+
+### 14.1. URL
+
+```
+GET /view/{project}/{year}/{month}/{folder_name}
+    ?id=<record_id>
+    &blocks=video,audio,transcript,protocol,summary
+```
+
+Пример:
+
+```
+http://localhost:8000/view/vNext/2026/09/2026-09-29%20тестовая%20запись
+    ?id=770e8400-e29b-41d4-a716-446655440111
+    &blocks=summary,transcript,protocol
+```
+
+### 14.2. Параметры
+
+| Параметр | Обяз. | Описание |
+|---|---|---|
+| `id` | ✅ | `id` из `_meta.json`. Без него — 404. |
+| `blocks` | ❌ | Список блоков через запятую. По умолчанию — `all`. |
+
+Допустимые значения `blocks`:
+
+| Блок | Что показывает |
+|---|---|
+| `video` | HTML5 `<video>` плеер (ссылка из `_links.json → video.url`) |
+| `audio` | HTML5 `<audio>` плеер (артефакт `kind=audio` или `_links.json → audio.url`) |
+| `transcript` | Ссылки на файлы стенограммы (открываются в новой вкладке) |
+| `protocol` | Текст протокола + кнопка «Скачать» |
+| `summary` | Текст `summary_bb` из `_meta.json` |
+| `all` | Все доступные блоки (значение по умолчанию) |
+
+Заголовок с именем, датой, тегами и описанием показывается **всегда**.
+
+### 14.3. Безопасность
+
+- Доступ **без API-ключа** — сервис должен быть за HTTPS, если
+  публикуется наружу.
+- `id` из URL должен совпадать с `id` в `_meta.json` — иначе 404.
+  Это защищает от перебора путей.
+- Soft-deleted записи (`_deleted.json`) → 404.
+- Файлы артефактов отдаются только из папки этой записи и только
+  те, что перечислены в `_meta.json`.
+- Path traversal закрыт (`_safe_segment`, `assert_inside`,
+  проверка `filename` на `/` и `\`).
+- **Rate limiting отсутствует.** Если сервис доступен из
+  интернета — ставить за reverse-proxy (nginx `limit_req`,
+  Traefik rate-limit middleware и т.п.).
+
+### 14.4. Публичные ссылки на артефакты
+
+Файлы записи отдаются по:
+
+```
+GET /view/{project}/{year}/{month}/{folder_name}/artifact/{filename}
+    ?id=<record_id>
+    &download=false
+```
+
+- `download=false` (по умолчанию) — `Content-Disposition: inline`;
+- `download=true` — `attachment` (скачать).
+
+### 14.5. Примеры
+
+**Всё, что есть:**
+
+```bash
+curl -s "http://localhost:8000/view/vNext/2026/09/rec?id=770e..." | less
+```
+
+**Только summary:**
+
+```
+http://localhost:8000/view/vNext/2026/09/rec?id=770e...&blocks=summary
+```
+
+**Видео + протокол:**
+
+```
+http://localhost:8000/view/vNext/2026/09/rec?id=770e...&blocks=video,protocol
+```
+
+**Встроить в iframe:**
+
+```html
+<iframe
+  src="http://localhost:8000/view/vNext/2026/09/rec?id=770e...&blocks=summary"
+  width="100%" height="400"
+  style="border:1px solid #ddd;border-radius:8px">
+</iframe>
+```
+
+**Скачать протокол (attachment):**
+
+```bash
+curl -OJ "http://localhost:8000/view/vNext/2026/09/rec/artifact/ПРОТОКОЛ.docx?id=770e...&download=true"
+```
+
+### 14.6. Ограничения
+
+- `.docx` и `.pdf` протоколы **не рендерятся как текст** — это
+  бинарные форматы. Показывается только кнопка «Скачать».
+  Текстовые (`.md`, `.txt`) — рендерятся.
+- Видео/аудио воспроизводятся браузером только если ссылка
+  доступна по HTTP(S). Ссылки `file:///...` браузер не откроет.
+- Страница не поддерживает Markdown-рендер `summary_bb` —
+  выводится как `<pre>` с исходным текстом.
+
+---
+
+## 15. Лицензия
 
 Внутренний проект Screen Recorder & Transcriber.
 
@@ -797,13 +968,15 @@ screc-server/
 │   ├── fts.py                  # полнотекстовый индекс
 │   ├── models.py               # Pydantic-схемы
 │   ├── records_service.py      # бизнес-логика
+│   ├── records_index.py        # индекс id → path
 │   └── api/
 │       ├── __init__.py
 │       ├── health.py
 │       ├── tree.py
 │       ├── records.py
 │       ├── artifacts.py
-│       └── sync.py
+│       ├── sync.py
+│       └── view.py             # публичный HTML-просмотр
 ├── Dockerfile
 ├── docker-compose.yml
 ├── docker-compose.override.yml.example
@@ -813,7 +986,7 @@ screc-server/
 ├── requirements.txt
 ├── run_local.sh
 ├── README.md                   # этот файл
-├── API.md                      # подробная документация API
+├── DOCS.md                     # подробная документация API
 ├── data/                       # монтируется в /data
 └── logs/                       # монтируется в /logs
 ```

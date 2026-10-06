@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .api import artifacts, health, records, sync, tree
+from .api import artifacts, health, records, sync, tree, view
 from .config import ensure_dirs, settings
 from .logger import (
     get_access_logger,
@@ -94,6 +94,11 @@ def create_app() -> FastAPI:
     app.include_router(records.router, prefix="/api/v1")
     app.include_router(artifacts.router, prefix="/api/v1")
     app.include_router(sync.router, prefix="/api/v1")
+
+    # --- публичный просмотр записи (без авторизации) ---
+    # Роутер view НЕ включается под /api/v1 и НЕ требует X-API-Key.
+    # Доступ защищён совпадением id из URL с id в _meta.json.
+    app.include_router(view.router)
 
     @app.on_event("startup")
     async def on_startup():
