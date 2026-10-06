@@ -4,10 +4,36 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
-# --- Публикация записи --------------------------------------------------
+# ---------------------------------------------------------------------------
+# Канонические типы артефактов
+# ---------------------------------------------------------------------------
+# Клиент обязан использовать эти значения в поле `kind`.
+# Публичный просмотр (/view/**) рендерит блоки именно по этому полю.
+#
+# Если нужно добавить новый тип — добавить сюда и в view.py
+# (см. _PROTOCOL_KINDS, _TRANSCRIPT_KINDS, _AUDIO_KINDS, ...).
+ARTIFACT_KINDS: frozenset[str] = frozenset({
+    # медиа
+    "video",
+    "audio",
+    # текст
+    "transcript",          # стенограмма
+    "protocol",            # автоматический протокол
+    "manual_protocol",     # ручной протокол
+    "summary",             # summary (файлом, если не пишется в _meta.json)
+    "deepseek_prompt",     # промпт для DeepSeek
+    "action_items",        # список действий
+    # прочее
+    "attachment",
+})
+
+
+# ---------------------------------------------------------------------------
+# Публикация записи
+# ---------------------------------------------------------------------------
 class RecordPayload(BaseModel):
     # Если id не задан — сервер сгенерирует UUID.
     id: Optional[str] = None
@@ -52,13 +78,38 @@ class RecordPayload(BaseModel):
     video_duration: float = 0.0
 
 
+# ---------------------------------------------------------------------------
+# Артефакты
+# ---------------------------------------------------------------------------
 class ArtifactInfo(BaseModel):
     kind: str
     filename: str
     size: int = 0
     sha256: str = ""
 
+    @field_validator("kind")
+    @classmethod
+    def _check_kind(cls, v: str) -> str:
+        """
+        Разрешаем только канонические kind.
 
+        Если kind пустой — трактуем как 'attachment'.
+        Неизвестный kind → ошибка валидации (400 при запросе).
+        """
+        v = (v or "").strip()
+        if not v:
+            return "attachment"
+        if v not in ARTIFACT_KINDS:
+            raise ValueError(
+                f"Unknown artifact kind: {v!r}. "
+                f"Allowed: {sorted(ARTIFACT_KINDS)}"
+            )
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Ответы
+# ---------------------------------------------------------------------------
 class RecordResponse(BaseModel):
     id: str
     revision: int

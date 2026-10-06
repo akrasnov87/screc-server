@@ -7,20 +7,28 @@
       &blocks=video,audio,transcript,protocol,summary
 
   GET /view/{project}/{year}/{month}/{folder_name}/artifact/{filename}
-      ?id=<record_id>
+      ?id=<record_id>&download=true|false
 
 Блоки, которые можно включать через ?blocks=:
-  • video       — HTML5 <video> плеер (ссылка из _links.json)
-  • audio       — HTML5 <audio> плеер (артефакт kind=audio или _links.json)
-  • transcript  — ссылка на файл стенограммы
-  • protocol    — текст протокола + кнопка «Скачать»
-  • summary     — текст summary_bb
+  • video       — HTML5 <video> плеер (артефакт kind=video
+                  или HTTP(S)-ссылка из _links.json)
+  • audio       — HTML5 <audio> плеер (артефакт kind=audio
+                  или HTTP(S)-ссылка из _links.json)
+  • transcript  — ссылки на файлы стенограммы
+  • protocol    — текст протокола + кнопки «Открыть»/«Скачать»
+  • summary     — текст summary_bb (или артефакт kind=summary)
   • all         — все доступные блоки (по умолчанию)
 
-Безопасность:
-  • id из URL должен совпадать с id в _meta.json;
-  • путь нормализуется через _safe_segment + assert_inside;
-  • файлы артефактов отдаются только из папки этой записи.
+Особенности:
+  • Если в _meta.json артефакт помечен kind='attachment', но имя
+    файла явно указывает на тип (manual_protocol.docx, summary.md,
+    transcript.txt, ...), применяется эвристика `_effective_kind`.
+    Это переходная мера — пока клиент не начнёт слать правильные
+    kind. См. комментарий к _NAME_TO_KIND.
+  • Если в _links.json лежит file://, а артефакт kind=video есть —
+    видео играется через /view/.../artifact/{filename}.
+  • Все ссылки на артефакты формируются через единый хелпер
+    _public_artifact_url с флагом download.
 """
 from __future__ import annotations
 
@@ -43,6 +51,71 @@ log = get_logger(__name__)
 _ALL_BLOCKS = {"video", "audio", "transcript", "protocol", "summary"}
 _META = "_meta.json"
 _LINKS = "_links.json"
+
+# ---------------------------------------------------------------------------
+# Канонические kind для блоков
+# ---------------------------------------------------------------------------
+_PROTOCOL_KINDS = {"protocol", "manual_protocol"}
+_TRANSCRIPT_KINDS = {"transcript"}
+_AUDIO_KINDS = {"audio"}
+_VIDEO_KINDS = {"video"}
+_SUMMARY_KINDS = {"summary"}
+
+
+# ---------------------------------------------------------------------------
+# Эвристика kind по имени файла (переходная мера)
+# ---------------------------------------------------------------------------
+# Применяется ТОЛЬКО если kind == 'attachment' или пустой.
+# Нужна, чтобы старые записи, где клиент не размечал kind,
+# корректно рендерились на публичной странице.
+#
+# ВАЖНО: выключить (сделать _NAME_TO_KIND = []) после того, как все
+# записи будут перезалиты с правильными kind. Иначе, например,
+# attachment protocol_final_v2.docx внезапно станет «протоколом».
+_NAME_TO_KIND: list[tuple[str, str]] = [
+    ("manual_protocol", "manual_protocol"),
+    ("protocol",        "protocol"),
+    ("transcript",      "transcript"),
+    ("summary",         "summary"),
+    ("deepseek_prompt", "deepseek_prompt"),
+    ("action_items",    "action_items"),
+]
+
+
+def _effective_kind(art: Dict[str, Any]) -> str:
+    """
+    Определяет «настоящий» kind артефакта.
+
+    1. Если kind задан и не 'attachment' — возвращаем его.
+    2. Если kind == 'attachment' — пытаемся угадать по имени файла.
+    3. Иначе — 'attachment'.
+    """
+    kind = (art.get("kind") or "").strip()
+    if kind and kind != "attachment":
+        return kind
+
+    fn = (art.get("filename") or "").lower()
+    stem = fn.rsplit(".", 1)[0] if "." in fn else fn
+
+    for prefix, mapped in _NAME_TO_KIND:
+        if (
+            stem == prefix
+            or stem.startswith(prefix + "_")
+            or stem.startswith(prefix + "-")
+            or stem.startswith(prefix + " ")
+        ):
+            return mapped
+    return "attachment"
+
+
+def _find_artifacts(
+    meta: Dict[str, Any], kinds: Set[str],
+) -> List[Dict[str, Any]]:
+    """Возвращает артефакты, чей эффективный kind ∈ kinds."""
+    return [
+        a for a in (meta.get("artifacts", []) or [])
+        if _effective_kind(a) in kinds
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +148,6 @@ def _record_dir(
 
     Бросает 404, если папки нет.
     """
-    # Та же санитизация, что и в paths.safe_relative_path
     safe = Path(
         _safe_segment(project, max_bytes=100),
         _safe_segment(year, max_bytes=10),
@@ -90,9 +162,7 @@ def _record_dir(
     return rdir
 
 
-def _load_record(
-    rdir: Path, record_id: str,
-) -> Dict[str, Any]:
+def _load_record(rdir: Path, record_id: str) -> Dict[str, Any]:
     """
     Читает _meta.json и проверяет совпадение id.
 
@@ -129,32 +199,41 @@ def _load_record(
 def _public_artifact_url(
     project: str, year: str, month: str, folder_name: str,
     filename: str, record_id: str,
+    *,
+    download: bool = False,
 ) -> str:
-    """Публичная ссылка на артефакт этой записи."""
-    return (
+    """
+    Публичная ссылка на артефакт этой записи.
+
+    download=False → Content-Disposition: inline
+    download=True  → Content-Disposition: attachment
+    """
+    url = (
         f"/view/{quote(project)}/{quote(year)}/{quote(month)}/"
         f"{quote(folder_name)}/artifact/{quote(filename)}"
         f"?id={quote(record_id)}"
     )
+    if download:
+        url += "&download=true"
+    return url
 
 
-def _find_artifact(
-    meta: Dict[str, Any], kind: str,
-) -> Optional[Dict[str, Any]]:
-    """Первый артефакт указанного kind."""
-    for art in meta.get("artifacts", []) or []:
-        if art.get("kind") == kind:
-            return art
-    return None
-
-
-def _find_artifacts(
-    meta: Dict[str, Any], kinds: Set[str],
-) -> List[Dict[str, Any]]:
-    return [
-        a for a in (meta.get("artifacts", []) or [])
-        if a.get("kind") in kinds
-    ]
+def _is_playable_url(url: str) -> bool:
+    """
+    Возвращает True, если ссылку на медиа можно отдать в <video>/
+    <audio>. Отсекаем file:// — браузер их не откроет, и плеер
+    будет пустой.
+    """
+    if not url:
+        return False
+    u = url.strip().lower()
+    return (
+        u.startswith("http://")
+        or u.startswith("https://")
+        or u.startswith("/")
+        or u.startswith("./")
+        or u.startswith("../")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +248,7 @@ _CSS = """
 :root {
   --bg: #f6f7f9; --card: #fff; --fg: #1c1e21;
   --muted: #65676b; --border: #dddfe2; --accent: #1877f2;
+  --warn-bg: #fff8e1; --warn-fg: #8a6d00;
 }
 * { box-sizing: border-box; }
 body {
@@ -219,6 +299,11 @@ pre.text {
 a.file-link { color: var(--accent); text-decoration: none; }
 a.file-link:hover { text-decoration: underline; }
 .empty { color: var(--muted); font-style: italic; }
+.warn {
+  background: var(--warn-bg); color: var(--warn-fg);
+  border: 1px solid #f0e0a0; border-radius: 8px;
+  padding: 10px 12px; font-size: 13px; margin-bottom: 8px;
+}
 .footer {
   text-align: center; color: var(--muted);
   font-size: 12px; margin-top: 24px;
@@ -226,7 +311,7 @@ a.file-link:hover { text-decoration: underline; }
 """
 
 
-def _render_meta_block(meta: Dict[str, Any], rdir: Path) -> str:
+def _render_meta_block(meta: Dict[str, Any]) -> str:
     """Заголовок + метаданные записи."""
     name = meta.get("name") or meta.get("folder_name") or "Запись"
     rows: List[str] = []
@@ -264,73 +349,169 @@ def _render_meta_block(meta: Dict[str, Any], rdir: Path) -> str:
     """
 
 
+# --- Видео -----------------------------------------------------------------
+def _guess_video_mime(fn: str) -> str:
+    ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
+    return {
+        "mp4":  "video/mp4",
+        "webm": "video/webm",
+        "mkv":  "video/x-matroska",
+        "mov":  "video/quicktime",
+        "avi":  "video/x-msvideo",
+    }.get(ext, "")
+
+
+def _guess_audio_mime(fn: str) -> str:
+    ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
+    return {
+        "mp3":  "audio/mpeg",
+        "m4a":  "audio/mp4",
+        "aac":  "audio/aac",
+        "ogg":  "audio/ogg",
+        "opus": "audio/opus",
+        "wav":  "audio/wav",
+        "flac": "audio/flac",
+    }.get(ext, "")
+
+
 def _render_video_block(
-    links: Dict[str, Any],
-) -> str:
-    video = links.get("video") or {}
-    url = (video.get("url") or "").strip()
-    if not url:
-        return ""
-    mime = video.get("mime") or ""
-    return f"""
-    <div class="card">
-      <h2>Видео</h2>
-      <video controls preload="metadata" src="{_e(url)}"
-             {'type="' + _e(mime) + '"' if mime else ''}>
-        Ваш браузер не поддерживает видео.
-        <a href="{_e(url)}">Скачать</a>
-      </video>
-    </div>
-    """
-
-
-def _render_audio_block(
     meta: Dict[str, Any],
+    links: Dict[str, Any],
     project: str, year: str, month: str, folder_name: str,
     record_id: str,
 ) -> str:
     """
-    Аудио: ищем артефакт kind=audio или audio в _links.json.
+    Видео-блок.
+
+    Приоритет:
+      1. HTTP(S)-ссылка из _links.json.
+      2. Артефакт kind=video — играем через /view/.../artifact/.
+      3. file:// или невалидная ссылка — предупреждение.
     """
-    # 1. Артефакт kind=audio
-    art = _find_artifact(meta, "audio")
-    if art:
-        src = _public_artifact_url(
-            project, year, month, folder_name,
-            art["filename"], record_id,
-        )
+    video = links.get("video") or {}
+    url = (video.get("url") or "").strip()
+    mime = video.get("mime") or ""
+
+    # 1. HTTP(S) из _links.json.
+    if url and _is_playable_url(url):
         return f"""
         <div class="card">
-          <h2>Аудио</h2>
-          <audio controls preload="metadata" src="{_e(src)}">
-            Ваш браузер не поддерживает аудио.
-            <a href="{_e(src)}">Скачать</a>
-          </audio>
+          <h2>Видео</h2>
+          <video controls preload="metadata" src="{_e(url)}"
+                 {'type="' + _e(mime) + '"' if mime else ''}>
+            Ваш браузер не поддерживает видео.
+            <a href="{_e(url)}">Скачать</a>
+          </video>
         </div>
         """
 
-    # 2. _links.json → audio
-    links = read_json(meta.get("_rdir", Path()) / "_links.json", default={}) or {}
-    audio = links.get("audio") or {}
-    url = (audio.get("url") or "").strip()
+    # 2. Артефакт kind=video.
+    arts = _find_artifacts(meta, _VIDEO_KINDS)
+    if arts:
+        fn = arts[0].get("filename", "")
+        src = _public_artifact_url(
+            project, year, month, folder_name, fn, record_id,
+        )
+        dl = _public_artifact_url(
+            project, year, month, folder_name, fn, record_id,
+            download=True,
+        )
+        if not mime:
+            mime = _guess_video_mime(fn)
+        return f"""
+        <div class="card">
+          <h2>Видео</h2>
+          <video controls preload="metadata" src="{_e(src)}"
+                 {'type="' + _e(mime) + '"' if mime else ''}>
+            Ваш браузер не поддерживает видео.
+            <a href="{_e(dl)}">Скачать</a>
+          </video>
+        </div>
+        """
+
+    # 3. file:// — предупреждение.
     if url:
         return f"""
         <div class="card">
-          <h2>Аудио</h2>
-          <audio controls preload="metadata" src="{_e(url)}">
-            Ваш браузер не поддерживает аудио.
-          </audio>
+          <h2>Видео</h2>
+          <div class="warn">
+            Ссылка на видео не может быть открыта в браузере
+            (например, <code>file://</code>). Загрузите видео
+            как артефакт <code>kind=video</code> или обновите
+            ссылку на HTTP(S).
+          </div>
+          <div><code>{_e(url)}</code></div>
         </div>
         """
     return ""
 
 
+# --- Аудио -----------------------------------------------------------------
+def _render_audio_block(
+    meta: Dict[str, Any],
+    links: Dict[str, Any],
+    project: str, year: str, month: str, folder_name: str,
+    record_id: str,
+) -> str:
+    # 1. Артефакт kind=audio.
+    arts = _find_artifacts(meta, _AUDIO_KINDS)
+    if arts:
+        art = arts[0]
+        fn = art.get("filename", "")
+        src = _public_artifact_url(
+            project, year, month, folder_name, fn, record_id,
+        )
+        dl = _public_artifact_url(
+            project, year, month, folder_name, fn, record_id,
+            download=True,
+        )
+        mime = _guess_audio_mime(fn)
+        return f"""
+        <div class="card">
+          <h2>Аудио</h2>
+          <audio controls preload="metadata" src="{_e(src)}"
+                 {'type="' + _e(mime) + '"' if mime else ''}>
+            Ваш браузер не поддерживает аудио.
+            <a href="{_e(dl)}">Скачать</a>
+          </audio>
+        </div>
+        """
+
+    # 2. _links.json → audio.
+    audio = links.get("audio") or {}
+    url = (audio.get("url") or "").strip()
+    if url and _is_playable_url(url):
+        mime = audio.get("mime") or ""
+        return f"""
+        <div class="card">
+          <h2>Аудио</h2>
+          <audio controls preload="metadata" src="{_e(url)}"
+                 {'type="' + _e(mime) + '"' if mime else ''}>
+            Ваш браузер не поддерживает аудио.
+          </audio>
+        </div>
+        """
+    if url and not _is_playable_url(url):
+        return f"""
+        <div class="card">
+          <h2>Аудио</h2>
+          <div class="warn">
+            Ссылка на аудио не может быть открыта в браузере
+            (например, <code>file://</code>).
+          </div>
+          <div><code>{_e(url)}</code></div>
+        </div>
+        """
+    return ""
+
+
+# --- Стенограмма -----------------------------------------------------------
 def _render_transcript_block(
     meta: Dict[str, Any],
     project: str, year: str, month: str, folder_name: str,
     record_id: str,
 ) -> str:
-    arts = _find_artifacts(meta, {"transcript"})
+    arts = _find_artifacts(meta, _TRANSCRIPT_KINDS)
     if not arts:
         return ""
     items = []
@@ -353,6 +534,7 @@ def _render_transcript_block(
     """
 
 
+# --- Протокол --------------------------------------------------------------
 def _render_protocol_block(
     meta: Dict[str, Any],
     rdir: Path,
@@ -360,31 +542,30 @@ def _render_protocol_block(
     record_id: str,
 ) -> str:
     """
-    Протокол: показываем текст + кнопку «Скачать».
-
-    Текст читаем из файла, если размер < 2 МБ и это текст.
-    Иначе — только ссылка на скачивание.
+    Протокол: показываем текст (если текстовый) + кнопки
+    «Открыть» (inline) и «Скачать» (attachment).
     """
-    arts = _find_artifacts(
-        meta, {"protocol", "manual_protocol"},
-    )
+    arts = _find_artifacts(meta, _PROTOCOL_KINDS)
     if not arts:
         return ""
 
     blocks: List[str] = []
     for art in arts:
         fn = art.get("filename", "")
-        url = _public_artifact_url(
+        inline_url = _public_artifact_url(
             project, year, month, folder_name, fn, record_id,
+            download=False,
         )
-        size = int(art.get("size", 0))
-        kind = art.get("kind", "protocol")
+        download_url = _public_artifact_url(
+            project, year, month, folder_name, fn, record_id,
+            download=True,
+        )
+        kind = _effective_kind(art)
         label = "Протокол" if kind == "protocol" else "Ручной протокол"
 
         text_html = ""
         p = rdir / fn
         if p.is_file() and p.stat().st_size < 2 * 1024 * 1024:
-            # Читаем как текст. Если бинарь — не показываем.
             if _is_text_file(p):
                 try:
                     content = p.read_text(
@@ -399,10 +580,15 @@ def _render_protocol_block(
         blocks.append(f"""
         <div style="margin-bottom:16px">
           <div style="display:flex;justify-content:space-between;
-                      align-items:center;margin-bottom:8px">
+                      align-items:center;margin-bottom:8px;
+                      gap:8px;flex-wrap:wrap">
             <strong>{_e(label)}: {_e(fn)}</strong>
-            <a class="btn secondary" href="{_e(url)}"
-               download>Скачать</a>
+            <span>
+              <a class="btn secondary" href="{_e(inline_url)}"
+                 target="_blank" rel="noopener">Открыть</a>
+              <a class="btn" href="{_e(download_url)}"
+                 download>Скачать</a>
+            </span>
           </div>
           {text_html}
         </div>
@@ -416,8 +602,35 @@ def _render_protocol_block(
     """
 
 
-def _render_summary_block(meta: Dict[str, Any]) -> str:
+# --- Summary ---------------------------------------------------------------
+def _render_summary_block(
+    meta: Dict[str, Any], rdir: Path,
+) -> str:
+    """
+    Summary: приоритет — summary_bb из _meta.json.
+    Фолбэк — артефакт kind=summary (текстовый, < 2 МБ).
+    """
     summary = (meta.get("summary_bb") or "").strip()
+
+    if not summary:
+        for art in _find_artifacts(meta, _SUMMARY_KINDS):
+            fn = art.get("filename", "")
+            p = rdir / fn
+            if not p.is_file():
+                continue
+            if p.stat().st_size >= 2 * 1024 * 1024:
+                continue
+            if not _is_text_file(p):
+                continue
+            try:
+                summary = p.read_text(
+                    encoding="utf-8", errors="replace",
+                ).strip()
+                if summary:
+                    break
+            except OSError:
+                pass
+
     if not summary:
         return ""
     return f"""
@@ -428,6 +641,7 @@ def _render_summary_block(meta: Dict[str, Any]) -> str:
     """
 
 
+# --- Утилиты ---------------------------------------------------------------
 def _is_text_file(path: Path) -> bool:
     """
     Грубая эвристика: считаем файл текстовым, если в первых
@@ -441,6 +655,7 @@ def _is_text_file(path: Path) -> bool:
     return b"\x00" not in chunk
 
 
+# --- Сборка страницы -------------------------------------------------------
 def _render_page(
     *,
     meta: Dict[str, Any],
@@ -451,13 +666,17 @@ def _render_page(
     record_id: str,
 ) -> str:
     parts: List[str] = []
-    parts.append(_render_meta_block(meta, rdir))
+    parts.append(_render_meta_block(meta))
 
     if "video" in blocks:
-        parts.append(_render_video_block(links))
+        parts.append(_render_video_block(
+            meta, links,
+            project, year, month, folder_name, record_id,
+        ))
     if "audio" in blocks:
         parts.append(_render_audio_block(
-            meta, project, year, month, folder_name, record_id,
+            meta, links,
+            project, year, month, folder_name, record_id,
         ))
     if "transcript" in blocks:
         parts.append(_render_transcript_block(
@@ -465,10 +684,11 @@ def _render_page(
         ))
     if "protocol" in blocks:
         parts.append(_render_protocol_block(
-            meta, rdir, project, year, month, folder_name, record_id,
+            meta, rdir,
+            project, year, month, folder_name, record_id,
         ))
     if "summary" in blocks:
-        parts.append(_render_summary_block(meta))
+        parts.append(_render_summary_block(meta, rdir))
 
     # Если после фильтрации не осталось ни одного блока кроме meta —
     # покажем подсказку.
@@ -528,7 +748,7 @@ async def view_record(
     """
     rdir = _record_dir(project, year, month, folder_name)
     meta = _load_record(rdir, id)
-    links = read_json(rdir / "_links.json", default={}) or {}
+    links = read_json(rdir / _LINKS, default={}) or {}
 
     enabled = _parse_blocks(blocks)
     log.info(
@@ -570,16 +790,13 @@ async def view_artifact(
 
     Защита:
       • id должен совпадать с _meta.json;
+      • filename должен быть в списке артефактов _meta.json;
       • filename не должен содержать '/' и '\\';
       • итоговый путь проверяется через assert_inside.
-
-    Отдаётся только файл, который перечислен в _meta.json
-    (защита от подсовывания чужих имён).
     """
     rdir = _record_dir(project, year, month, folder_name)
     meta = _load_record(rdir, id)
 
-    # Должен быть в списке артефактов.
     known = {
         a.get("filename") for a in (meta.get("artifacts") or [])
     }
