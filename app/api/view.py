@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import html
+import mimetypes              # ← НОВОЕ
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote
@@ -654,6 +655,65 @@ def _is_text_file(path: Path) -> bool:
         return False
     return b"\x00" not in chunk
 
+# ---------------------------------------------------------------------------
+# MIME-типы для артефактов
+# ---------------------------------------------------------------------------
+# mimetypes.guess_type не знает про некоторые контейнеры
+# (например, .mkv → application/octet-stream). Здесь мы
+# дополняем стандартный набор.
+_EXTRA_MIME_TYPES: Dict[str, str] = {
+    # Видео
+    ".mp4":  "video/mp4",
+    ".m4v":  "video/mp4",
+    ".mov":  "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv":  "video/x-matroska",
+    ".avi":  "video/x-msvideo",
+    ".flv":  "video/x-flv",
+    ".wmv":  "video/x-ms-wmv",
+    # Аудио
+    ".mp3":  "audio/mpeg",
+    ".m4a":  "audio/mp4",
+    ".aac":  "audio/aac",
+    ".ogg":  "audio/ogg",
+    ".opus": "audio/opus",
+    ".wav":  "audio/wav",
+    ".flac": "audio/flac",
+    # Текст и документы
+    ".txt":  "text/plain; charset=utf-8",
+    ".md":   "text/markdown; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".pdf":  "application/pdf",
+    ".docx": (
+        "application/vnd.openxmlformats-officedocument."
+        "wordprocessingml.document"
+    ),
+}
+
+
+def _guess_media_type(filename: str) -> str:
+    """
+    Определяет MIME-тип по имени файла.
+
+    Приоритеты:
+      1. Наш словарь _EXTRA_MIME_TYPES (для видео/аудио — самое
+         важное, чтобы браузер включил native controls и
+         поддержал Range-запросы при перемотке).
+      2. mimetypes.guess_type как fallback.
+      3. application/octet-stream — если совсем ничего.
+    """
+    if not filename:
+        return "application/octet-stream"
+
+    ext = ""
+    if "." in filename:
+        ext = "." + filename.rsplit(".", 1)[-1].lower()
+
+    if ext in _EXTRA_MIME_TYPES:
+        return _EXTRA_MIME_TYPES[ext]
+
+    guessed, _enc = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
 
 # --- Сборка страницы -------------------------------------------------------
 def _render_page(
@@ -793,6 +853,15 @@ async def view_artifact(
       • filename должен быть в списке артефактов _meta.json;
       • filename не должен содержать '/' и '\\';
       • итоговый путь проверяется через assert_inside.
+
+    Для видео и аудио явно задаём media_type — иначе браузер
+    может получить application/octet-stream и отказаться
+    перематывать.
+
+    FileResponse в Starlette автоматически поддерживает
+    HTTP Range-запросы (Accept-Ranges, Content-Range,
+    206 Partial Content) — именно это включает в HTML5-плеере
+    перемотку и мгновенное воспроизведение.
     """
     rdir = _record_dir(project, year, month, folder_name)
     meta = _load_record(rdir, id)
@@ -815,12 +884,21 @@ async def view_artifact(
     if not path.is_file():
         raise HTTPException(404, "Artifact not found")
 
+    # --- Явный media_type: критично для HTML5-плеера ---
+    # Если media_type не задать, FileResponse определит его
+    # через mimetypes.guess_type — но для некоторых расширений
+    # (например, .mkv) получится application/octet-stream,
+    # и браузер откажется перематывать.
+    media_type = _guess_media_type(filename)
+
     log.info(
-        "view/artifact: record=%s, file=%s, size=%d, download=%s",
-        id, filename, path.stat().st_size, download,
+        "view/artifact: record=%s, file=%s, size=%d, "
+        "media_type=%s, download=%s",
+        id, filename, path.stat().st_size, media_type, download,
     )
     return FileResponse(
         path,
         filename=filename,
+        media_type=media_type,
         content_disposition_type="attachment" if download else "inline",
     )
